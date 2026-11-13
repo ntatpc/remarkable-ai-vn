@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch AI Assistant Export Trigger File
+
+[Path]
+PathExists=/home/root/AI_Notes/export_trigger.conf
+PathChanged=/home/root/AI_Notes/export_trigger.conf
+Unit=ai-exporter.service
+
+[Install]
+WantedBy=multi-user.target

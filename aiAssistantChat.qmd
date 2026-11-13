@@ -1,0 +1,2638 @@
+; AI Agent for reMarkable Paper Pure - Complete Community Edition
+
+AFFECT [[1224665461898798997]]
+IMPORT QtQuick 2.15
+IMPORT QtQuick.Controls 2.15
+IMPORT Qt.labs.settings 1.0
+IMPORT Qt.labs.folderlistmodel 2.15
+
+TRAVERSE [[8397993708429497603]]#[[6504254477]]
+LOCATE AFTER ALL
+INSERT {
+    Item {
+        id: aiOverlayRoot
+        anchors.fill: parent
+        z: 10000
+
+        FontLoader {
+            id: vnFontLoader
+            source: "file:///home/root/AI_Notes/NotoSans-Regular.ttf"
+        }
+        property string vnFont: vnFontLoader.status === FontLoader.Ready ? vnFontLoader.name : "Noto Sans"
+
+        // Lưu trữ bền vững bằng Qt.labs.settings (Không phụ thuộc SQLite)
+        Settings {
+            id: persistentSettings
+            fileName: "/home/root/AI_Notes/notebook_data.conf"
+            property string savedNotesJson: "[]"
+            property string disabledExtensionsJson: "[]"
+            property string thinkingLevel: "low"
+            property string deviceModelName: "reMarkable"
+            property int customWinWidth: 1100
+            property int customWinHeight: 1620
+        }
+
+        property bool chatVisible: false
+        property bool settingsPageVisible: false
+        property bool notebookPageVisible: false
+        property bool modelMenuVisible: false
+        property bool saveMenuVisible: false
+        property bool isSending: false
+        property bool isFetchingModels: false
+        property string quotedSelection: ""
+
+        property string thinkingLevel: persistentSettings.thinkingLevel || "low"
+        property string sessionTitle: "Ghi_chu_AI_" + Qt.formatDateTime(new Date(), "yyyyMMdd_hhmm")
+
+        // Quản lý danh sách Extensions nạp động từ /home/root/AI_Notes/extensions/
+        property var loadedExtensions: []
+        property var utilityMenuItems: []
+        property var disabledExtensionsMap: ({})
+        property var activeXhrRequest: null
+
+        // Trạng thái xem chi tiết 1 ghi chú trong Sổ tay QML (-1 là đang ở danh sách)
+        property int selectedNotebookIndex: -1
+        property string viewingNoteTitle: ""
+        property string viewingNoteDate: ""
+        property string viewingNoteContent: ""
+
+        // 0: Ô nhập chat, 1: Gemini Key, 2: Claude Key, 3: OpenAI Key, 4: Ô tìm kiếm Model
+        property string currentDraftText: ""
+        property int activeKeyField: 0
+
+        property string modelSearchQuery: ""
+        property string selectedProviderFilter: "all"
+
+        property bool showVirtualKeyboard: true
+        property bool symbolPageActive: false
+        property bool telexEnabled: true
+        property bool shiftActive: false
+
+        property string apiWarningBanner: ""
+        property string tokenWarningBanner: ""
+        property string saveStatusToast: ""
+        property string modelSyncStatus: "Chưa đồng bộ trực tuyến (Đang dùng danh sách mặc định)"
+
+        property string geminiApiKey: ""
+        property string anthropicApiKey: ""
+        property string openaiApiKey: ""
+        property string systemInstruction: "Bạn là trợ lý AI chạy trực tiếp trên máy đọc sách reMarkable. Hãy trả lời bằng tiếng Việt súc tích, rõ ràng, định dạng dễ đọc trên màn hình E-Ink."
+
+        property var allModelsMaster: [
+            { "label": "Gemini 2.5 Pro",            "provider": "gemini", "id": "gemini-2.5-pro",             "isFree": false, "enabled": true, "maxOutputTokens": 2048 },
+            { "label": "Gemini 2.5 Flash (Free)",   "provider": "gemini", "id": "gemini-2.5-flash",           "isFree": true,  "enabled": true, "maxOutputTokens": 2048 },
+            { "label": "Gemini 2.0 Flash (Free)",   "provider": "gemini", "id": "gemini-2.0-flash",           "isFree": true,  "enabled": true, "maxOutputTokens": 2048 },
+            { "label": "Claude 4 Sonnet",           "provider": "claude", "id": "claude-sonnet-4-20250514",   "isFree": false, "enabled": true, "maxOutputTokens": 2048 },
+            { "label": "Claude 3.7 Sonnet",         "provider": "claude", "id": "claude-3-7-sonnet-20250219", "isFree": false, "enabled": true, "maxOutputTokens": 2048 },
+            { "label": "Claude 3.5 Sonnet",         "provider": "claude", "id": "claude-3-5-sonnet-20241022", "isFree": false, "enabled": true, "maxOutputTokens": 2048 },
+            { "label": "Claude 3.5 Haiku",          "provider": "claude", "id": "claude-3-5-haiku-20241022",  "isFree": true,  "enabled": true, "maxOutputTokens": 2048 },
+            { "label": "OpenAI GPT-4o",             "provider": "openai", "id": "gpt-4o",                     "isFree": false, "enabled": true, "maxOutputTokens": 1500 },
+            { "label": "OpenAI GPT-4o Mini",        "provider": "openai", "id": "gpt-4o-mini",                "isFree": true,  "enabled": true, "maxOutputTokens": 1500 }
+        ]
+
+        property var availableModels: []
+        property var filteredSettingsModels: []
+
+        property int currentModelIndex: 0
+        property var conversationHistory: []
+
+        property bool selectionMenuActive: false
+        property real popupAnchorX: parent.width / 2 - 190
+        property real popupAnchorY: parent.height / 2 - 120
+
+        ListModel { id: chatLogModel }
+        ListModel { id: savedNotebookModel }
+
+        TextEdit {
+            id: hiddenClipboardBridge
+            visible: false
+            enabled: false
+            focus: false
+        }
+
+        // Quét tự động thư mục /home/root/AI_Notes/extensions/
+        FolderListModel {
+            id: extensionFolderScanner
+            folder: "file:///home/root/AI_Notes/extensions"
+            showDirs: false
+            showDotAndDotDot: false
+            sortField: FolderListModel.Name
+            onStatusChanged: {
+                if (extensionFolderScanner.status === FolderListModel.Ready) {
+                    aiOverlayRoot.scanAndLoadExtensions();
+                }
+            }
+        }
+
+        Component.onCompleted: {
+            loadDisabledExtensionsState();
+            rebuildActiveAndFilteredModels();
+            initAndLoadNotebookDB();
+            loadApiKeysDirectlyFromTxt(true);
+            scanAndLoadExtensions();
+        }
+
+        function suppressSystemKeyboard() {
+            try { Qt.inputMethod.hide(); } catch (e) {}
+        }
+
+        function replaceAllStr(src, findStr, repStr) {
+            if (!src) return "";
+            return src.split(findStr).join(repStr);
+        }
+
+        function cleanKeyString(s) {
+            if (!s) return "";
+            var out = "";
+            for (var i = 0; i < s.length; i++) {
+                var ch = s.charAt(i);
+                if (ch !== " " && ch !== "\r" && ch !== "\n" && ch !== "\t" && ch !== "\"" && ch !== "'") {
+                    out += ch;
+                }
+            }
+            return out;
+        }
+
+        // =========================================================================
+        // HỆ THỐNG NẠP ĐỘNG & BẬT/TẮT EXTENSION (/home/root/AI_Notes/extensions/)
+        // =========================================================================
+        function loadDisabledExtensionsState() {
+            var map = {};
+            try {
+                var arr = JSON.parse(persistentSettings.disabledExtensionsJson || "[]");
+                for (var i = 0; i < arr.length; i++) {
+                    map[arr[i]] = true;
+                }
+            } catch (e) {}
+            disabledExtensionsMap = map;
+        }
+
+        function saveDisabledExtensionsState() {
+            var arr = [];
+            for (var k in disabledExtensionsMap) {
+                if (disabledExtensionsMap[k] === true) {
+                    arr.push(k);
+                }
+            }
+            persistentSettings.disabledExtensionsJson = JSON.stringify(arr);
+        }
+
+        function isExtensionEnabled(extId) {
+            return !(disabledExtensionsMap[extId] === true);
+        }
+
+        function toggleExtensionEnabled(extId) {
+            var copyMap = {};
+            for (var k in disabledExtensionsMap) {
+                copyMap[k] = disabledExtensionsMap[k];
+            }
+            if (copyMap[extId] === true) {
+                copyMap[extId] = false;
+                showToast("✓ Đã BẬT tiện ích!");
+            } else {
+                copyMap[extId] = true;
+                showToast("✓ Đã TẮT tiện ích!");
+            }
+            disabledExtensionsMap = copyMap;
+            saveDisabledExtensionsState();
+            rebuildUtilityMenuItems();
+        }
+
+        // Tìm trực tiếp đối tượng QML sống trong extensionHostContainer (Không qua mảng var trung gian)
+        function findExtensionObjectById(extId) {
+            if (!extensionHostContainer || !extensionHostContainer.children) return null;
+            var kids = extensionHostContainer.children;
+            for (var i = 0; i < kids.length; i++) {
+                var child = kids[i];
+                if (child && child.extensionId === extId) {
+                    return child;
+                }
+            }
+            return null;
+        }
+
+        // Tạo danh sách phẳng 1 cấp cho Dropdown "Tiện ích ▾" (Giống hệt availableModels)
+        function rebuildUtilityMenuItems() {
+            var flatList = [];
+            flatList.push({
+                "rowType": "builtin",
+                "extId": "core",
+                "actionId": "save_notebook",
+                "label": "📚 Lưu phiên hiện tại vào Sổ tay nội bộ",
+                "isEnabled": true
+            });
+            flatList.push({
+                "rowType": "builtin",
+                "extId": "core",
+                "actionId": "copy_all",
+                "label": "📋 Chép toàn bộ lịch sử Chat vào Clipboard",
+                "isEnabled": true
+            });
+
+            for (var i = 0; i < loadedExtensions.length; i++) {
+                var ext = loadedExtensions[i];
+                var active = isExtensionEnabled(ext.extensionId);
+                flatList.push({
+                    "rowType": "toggle",
+                    "extId": ext.extensionId,
+                    "actionId": "toggle_ext",
+                    "label": (active ? "[✓] BẬT: " : "[  ] TẮT: ") + ext.extensionName,
+                    "isEnabled": active
+                });
+
+                if (active && ext.extensionActions) {
+                    for (var a = 0; a < ext.extensionActions.length; a++) {
+                        var act = ext.extensionActions[a];
+                        var code = act.actionId || act.id || "";
+                        var textLabel = act.label || code;
+                        flatList.push({
+                            "rowType": "action",
+                            "extId": ext.extensionId,
+                            "actionId": code,
+                            "label": "   ▸ " + textLabel,
+                            "isEnabled": true
+                        });
+                    }
+                }
+            }
+            utilityMenuItems = flatList;
+        }
+
+        function scanAndLoadExtensions() {
+            var candidateUrls = [];
+            var count = extensionFolderScanner.count;
+            for (var i = 0; i < count; i++) {
+                var fName = extensionFolderScanner.get(i, "fileName");
+                var fUrl = extensionFolderScanner.get(i, "fileURL").toString();
+                if (fName && fName.length > 4 && fName.substring(fName.length - 4) === ".qml") {
+                    candidateUrls.push(fUrl);
+                }
+            }
+
+            var defaultExtFiles = ["epubPdfExporter.qml", "guideExtension.qml"];
+            for (var d = 0; d < defaultExtFiles.length; d++) {
+                var defUrl = "file:///home/root/AI_Notes/extensions/" + defaultExtFiles[d];
+                var existed = false;
+                for (var c = 0; c < candidateUrls.length; c++) {
+                    if (candidateUrls[c].indexOf(defaultExtFiles[d]) !== -1) {
+                        existed = true;
+                        break;
+                    }
+                }
+                if (!existed) candidateUrls.push(defUrl);
+            }
+
+            for (var u = 0; u < candidateUrls.length; u++) {
+                try {
+                    var comp = Qt.createComponent(candidateUrls[u]);
+                    if (comp.status === Component.Ready) {
+                        var tempObj = comp.createObject(extensionHostContainer);
+                        if (tempObj && tempObj.extensionId) {
+                            // Kiểm tra nếu đã nạp extensionId này rồi thì hủy bản trùng lặp
+                            var existingCount = 0;
+                            var kids = extensionHostContainer.children;
+                            for (var k = 0; k < kids.length; k++) {
+                                if (kids[k] && kids[k].extensionId === tempObj.extensionId) {
+                                    existingCount++;
+                                }
+                            }
+                            if (existingCount > 1) {
+                                tempObj.destroy();
+                            }
+                        } else if (tempObj) {
+                            tempObj.destroy();
+                        }
+                    }
+                } catch (err) {}
+            }
+
+            // Đọc danh sách metadata từ các QObject đang sống trong extensionHostContainer
+            var metaList = [];
+            if (extensionHostContainer && extensionHostContainer.children) {
+                var hostKids = extensionHostContainer.children;
+                for (var h = 0; h < hostKids.length; h++) {
+                    var inst = hostKids[h];
+                    if (inst && inst.extensionId) {
+                        var actionsCopy = [];
+                        if (inst.extensionActions) {
+                            for (var ac = 0; ac < inst.extensionActions.length; ac++) {
+                                actionsCopy.push({
+                                    "actionId": inst.extensionActions[ac].actionId || inst.extensionActions[ac].id || "",
+                                    "label": inst.extensionActions[ac].label || ""
+                                });
+                            }
+                        }
+                        metaList.push({
+                            "extensionId": inst.extensionId,
+                            "extensionName": inst.extensionName || inst.extensionId,
+                            "extensionDescription": inst.extensionDescription || "",
+                            "extensionActions": actionsCopy
+                        });
+                    }
+                }
+            }
+
+            loadedExtensions = metaList;
+            rebuildUtilityMenuItems();
+        }
+
+        function buildChatContextData(customTitle, customTranscriptText) {
+            var sessionMsgs = [];
+            for (var i = 0; i < chatLogModel.count; i++) {
+                var row = chatLogModel.get(i);
+                sessionMsgs.push({
+                    "sender": row.sender === "Bạn" ? "user" : "ai",
+                    "senderLabel": row.sender,
+                    "text": row.msgText,
+                    "timestamp": Qt.formatDateTime(new Date(), "hh:mm")
+                });
+            }
+
+            var activeModelLabel = "AI Assistant";
+            if (availableModels.length > 0 && currentModelIndex >= 0 && currentModelIndex < availableModels.length) {
+                activeModelLabel = availableModels[currentModelIndex].label;
+            }
+
+            return {
+                "title": customTitle || aiOverlayRoot.sessionTitle,
+                "currentSession": sessionMsgs,
+                "transcriptText": customTranscriptText || buildTranscriptMarkdown(),
+                "activeModel": activeModelLabel,
+                "deviceModel": persistentSettings.deviceModelName
+            };
+        }
+
+        function triggerExtensionActionById(extId, actionId, customContext) {
+            if (!isExtensionEnabled(extId)) {
+                showToast("⚠ Tiện ích này đang tắt! Hãy bật [✓] trong menu [Tiện ích ▾].");
+                return;
+            }
+            var liveObj = findExtensionObjectById(extId);
+            if (!liveObj || typeof liveObj.executeAction !== "function") {
+                showToast("⚠ Không tìm thấy hàm thực thi của tiện ích [" + extId + "]!");
+                return;
+            }
+            var ctx = customContext || buildChatContextData("", "");
+            try {
+                liveObj.executeAction(actionId, ctx);
+            } catch (e) {
+                showToast("⚠ Lỗi thực thi tiện ích: " + e);
+            }
+        }
+
+        function delegateExportToExtension(noteTitle, noteContent, formatActionId) {
+            var targetExt = findExtensionObjectById("builtin_exporter");
+            if (!targetExt) {
+                targetExt = findExtensionObjectById("epub_pdf_exporter");
+            }
+            if (!targetExt) {
+                showToast("⚠ Chưa tìm thấy tiện ích epubPdfExporter.qml trong /extensions/!");
+                return;
+            }
+            if (!isExtensionEnabled(targetExt.extensionId)) {
+                showToast("⚠ Tiện ích Xuất EPUB/PDF đang bị tắt trong menu [Tiện ích ▾]!");
+                return;
+            }
+            var customSession = [];
+            if (noteContent && noteContent !== "") {
+                customSession.push({
+                    "sender": "ai",
+                    "senderLabel": "Nội dung Sổ tay",
+                    "text": noteContent,
+                    "timestamp": Qt.formatDateTime(new Date(), "hh:mm")
+                });
+            }
+            var ctx = buildChatContextData(noteTitle || aiOverlayRoot.sessionTitle, noteContent || "");
+            if (customSession.length > 0) {
+                ctx.currentSession = customSession;
+            }
+            triggerExtensionActionById(targetExt.extensionId, formatActionId || "export_epub", ctx);
+        }
+        // =========================================================================
+        // HỆ THỐNG SỔ TAY QML NỘI BỘ (DÙNG Qt.labs.settings - KHÔNG CẦN SQLITE)
+        // =========================================================================
+        function initAndLoadNotebookDB() {
+            savedNotebookModel.clear();
+            try {
+                var raw = persistentSettings.savedNotesJson || "[]";
+                var arr = JSON.parse(raw);
+                for (var i = 0; i < arr.length; i++) {
+                    var row = arr[i];
+                    savedNotebookModel.append({
+                        "noteId": row.noteId || "",
+                        "title": row.title || "",
+                        "createdAt": row.createdAt || "",
+                        "content": row.content || ""
+                    });
+                }
+            } catch (e) {}
+        }
+
+        function persistNotebookModelToSettings() {
+            var arr = [];
+            for (var i = 0; i < savedNotebookModel.count; i++) {
+                var item = savedNotebookModel.get(i);
+                arr.push({
+                    "noteId": item.noteId,
+                    "title": item.title,
+                    "createdAt": item.createdAt,
+                    "content": item.content
+                });
+            }
+            persistentSettings.savedNotesJson = JSON.stringify(arr);
+        }
+
+        function buildTranscriptMarkdown() {
+            var lines = [];
+            lines.push("# " + aiOverlayRoot.sessionTitle);
+            lines.push("Thời gian: " + Qt.formatDateTime(new Date(), "dd/MM/yyyy hh:mm:ss"));
+            lines.push("----------------------------------------\n");
+            for (var i = 0; i < chatLogModel.count; i++) {
+                var item = chatLogModel.get(i);
+                lines.push("[" + item.sender + "]:");
+                lines.push(item.msgText + "\n");
+            }
+            return lines.join("\n");
+        }
+
+        function saveCurrentChatToQMLNotebook(silentMode) {
+            if (chatLogModel.count === 0) {
+                if (!silentMode) showToast("⚠ Chưa có nội dung trò chuyện để lưu vào Sổ tay!");
+                return false;
+            }
+            var fullText = buildTranscriptMarkdown();
+            var nowStr = Qt.formatDateTime(new Date(), "dd/MM/yyyy hh:mm:ss");
+            var firstQuestion = chatLogModel.get(0).msgText || aiOverlayRoot.sessionTitle;
+            if (firstQuestion.length > 48) {
+                firstQuestion = firstQuestion.substring(0, 48) + "...";
+            }
+            var displayTitle = aiOverlayRoot.sessionTitle + " - " + replaceAllStr(firstQuestion, "\n", " ");
+
+            try {
+                var updated = false;
+                for (var i = 0; i < savedNotebookModel.count; i++) {
+                    if (savedNotebookModel.get(i).noteId === aiOverlayRoot.sessionTitle) {
+                        savedNotebookModel.setProperty(i, "title", displayTitle);
+                        savedNotebookModel.setProperty(i, "createdAt", nowStr);
+                        savedNotebookModel.setProperty(i, "content", fullText);
+                        updated = true;
+                        break;
+                    }
+                }
+                if (!updated) {
+                    savedNotebookModel.insert(0, {
+                        "noteId": aiOverlayRoot.sessionTitle,
+                        "title": displayTitle,
+                        "createdAt": nowStr,
+                        "content": fullText
+                    });
+                }
+                persistNotebookModelToSettings();
+                if (!silentMode) {
+                    showToast("✓ Đã lưu vào [📚 Sổ tay] trong ứng dụng!");
+                }
+                return true;
+            } catch (e) {
+                if (!silentMode) showToast("⚠ Không thể ghi vào Sổ tay nội bộ.");
+                return false;
+            }
+        }
+
+        function deleteNoteFromQMLNotebook(noteIdToDelete) {
+            try {
+                for (var i = 0; i < savedNotebookModel.count; i++) {
+                    if (savedNotebookModel.get(i).noteId === noteIdToDelete) {
+                        savedNotebookModel.remove(i);
+                        break;
+                    }
+                }
+                selectedNotebookIndex = -1;
+                persistNotebookModelToSettings();
+                showToast("✓ Đã xóa ghi chú khỏi Sổ tay!");
+            } catch (e) {}
+        }
+
+        // =========================================================================
+        // TÍNH TOÁN HẠN MỨC TOKEN & CHỈ THỊ THEO "MỨC ĐỘ TƯ DUY" (0 DẤU SAO)
+        // =========================================================================
+        function computeEffectiveMaxTokens(modelObj) {
+            var baseLimit = (modelObj && modelObj.maxOutputTokens) ? modelObj.maxOutputTokens : 2048;
+            if (aiOverlayRoot.thinkingLevel === "medium") {
+                return baseLimit << 1; // Gấp đôi (2x)
+            } else if (aiOverlayRoot.thinkingLevel === "high") {
+                return baseLimit << 2; // Gấp bốn (4x)
+            }
+            return baseLimit; // Mức Thấp mặc định (1x)
+        }
+
+        function buildEffectiveSystemInstruction() {
+            if (aiOverlayRoot.thinkingLevel === "medium") {
+                return systemInstruction + " Hãy giải thích chi tiết, trình bày rõ các bước lập luận và kèm ví dụ minh họa.";
+            } else if (aiOverlayRoot.thinkingLevel === "high") {
+                return systemInstruction + " Hãy vận dụng tư duy sâu sắc nhất (Deep Step-by-Step Reasoning): phân tích đa chiều, lập luận chặt chẽ từng bước và cung cấp câu trả lời đầy đủ, trọn vẹn nhất mà không cắt bớt nội dung.";
+            }
+            return systemInstruction;
+        }
+
+        // =========================================================================
+        // QUẢN LÝ BỘ LỌC & HỘP KIỂM CHỌN MODEL TRONG TRANG CÀI ĐẶT
+        // =========================================================================
+        function rebuildActiveAndFilteredModels() {
+            var currentSelectedId = "";
+            if (availableModels.length > 0 && currentModelIndex >= 0 && currentModelIndex < availableModels.length) {
+                currentSelectedId = availableModels[currentModelIndex].id;
+            }
+
+            var activeList = [];
+            var settingsList = [];
+            var q = (modelSearchQuery || "").trim().toLowerCase();
+
+            for (var i = 0; i < allModelsMaster.length; i++) {
+                var item = allModelsMaster[i];
+                if (item.enabled) {
+                    activeList.push(item);
+                }
+
+                var matchProv = (selectedProviderFilter === "all" || item.provider === selectedProviderFilter);
+                var matchQuery = (q === "" || item.label.toLowerCase().indexOf(q) !== -1 || item.id.toLowerCase().indexOf(q) !== -1);
+                if (matchProv && matchQuery) {
+                    settingsList.push({
+                        "masterIndex": i,
+                        "label": item.label,
+                        "provider": item.provider,
+                        "id": item.id,
+                        "isFree": item.isFree,
+                        "enabled": item.enabled,
+                        "maxOutputTokens": item.maxOutputTokens || 2048
+                    });
+                }
+            }
+
+            if (activeList.length === 0 && allModelsMaster.length > 0) {
+                allModelsMaster[0].enabled = true;
+                activeList.push(allModelsMaster[0]);
+                if (settingsList.length > 0 && settingsList[0].masterIndex === 0) {
+                    settingsList[0].enabled = true;
+                }
+            }
+
+            availableModels = activeList;
+            filteredSettingsModels = settingsList;
+
+            var foundIdx = 0;
+            for (var j = 0; j < availableModels.length; j++) {
+                if (availableModels[j].id === currentSelectedId) {
+                    foundIdx = j;
+                    break;
+                }
+            }
+            currentModelIndex = foundIdx;
+            verifyActiveApiConnection();
+        }
+
+        function toggleModelEnabledAtMaster(masterIdx) {
+            if (masterIdx < 0 || masterIdx >= allModelsMaster.length) return;
+            var copyMaster = [];
+            var enabledCount = 0;
+            for (var i = 0; i < allModelsMaster.length; i++) {
+                var m = allModelsMaster[i];
+                var newEnabled = (i === masterIdx) ? (!m.enabled) : m.enabled;
+                if (newEnabled) enabledCount++;
+                copyMaster.push({
+                    "label": m.label,
+                    "provider": m.provider,
+                    "id": m.id,
+                    "isFree": m.isFree,
+                    "enabled": newEnabled,
+                    "maxOutputTokens": m.maxOutputTokens || 2048
+                });
+            }
+            if (enabledCount === 0) {
+                showToast("⚠ Cần giữ ít nhất 1 model được kích hoạt cho cửa sổ Chat!");
+                return;
+            }
+            allModelsMaster = copyMaster;
+            rebuildActiveAndFilteredModels();
+        }
+
+        function setBulkModelsEnabledForCurrentFilter(enableState) {
+            var q = (modelSearchQuery || "").trim().toLowerCase();
+            var copyMaster = [];
+            var totalEnabled = 0;
+
+            for (var i = 0; i < allModelsMaster.length; i++) {
+                var m = allModelsMaster[i];
+                var matchProv = (selectedProviderFilter === "all" || m.provider === selectedProviderFilter);
+                var matchQuery = (q === "" || m.label.toLowerCase().indexOf(q) !== -1 || m.id.toLowerCase().indexOf(q) !== -1);
+                var nextState = (matchProv && matchQuery) ? enableState : m.enabled;
+                if (nextState) totalEnabled++;
+                copyMaster.push({
+                    "label": m.label,
+                    "provider": m.provider,
+                    "id": m.id,
+                    "isFree": m.isFree,
+                    "enabled": nextState,
+                    "maxOutputTokens": m.maxOutputTokens || 2048
+                });
+            }
+
+            if (totalEnabled === 0 && copyMaster.length > 0) {
+                copyMaster[0].enabled = true;
+                showToast("✓ Đã bỏ chọn (Giữ lại 1 model mặc định cho cửa sổ Chat)!");
+            }
+            allModelsMaster = copyMaster;
+            rebuildActiveAndFilteredModels();
+        }
+
+        function loadApiKeysDirectlyFromTxt(autoFetchAfterLoad) {
+            var xhr = new XMLHttpRequest();
+            xhr.open("GET", "file:///home/root/AI_Notes/api_keys.txt", true);
+            xhr.onreadystatechange = function() {
+                if (xhr.readyState === XMLHttpRequest.DONE) {
+                    if (xhr.status === 200 || xhr.status === 0) {
+                        var lines = (xhr.responseText || "").split("\n");
+                        for (var i = 0; i < lines.length; i++) {
+                            var line = lines[i].trim();
+                            if (line.indexOf("GEMINI_KEY=") === 0) {
+                                var gk = cleanKeyString(line.substring(11));
+                                if (gk !== "" && gk !== "AIzaSy...") geminiApiKey = gk;
+                            } else if (line.indexOf("CLAUDE_KEY=") === 0) {
+                                var ck = cleanKeyString(line.substring(11));
+                                if (ck !== "" && ck !== "sk-ant-...") anthropicApiKey = ck;
+                            } else if (line.indexOf("OPENAI_KEY=") === 0) {
+                                var ok = cleanKeyString(line.substring(11));
+                                if (ok !== "" && ok !== "sk-proj-...") openaiApiKey = ok;
+                            }
+                        }
+                    }
+                    verifyActiveApiConnection();
+                    if (autoFetchAfterLoad && (geminiApiKey !== "" || anthropicApiKey !== "" || openaiApiKey !== "")) {
+                        fetchAllAvailableModels();
+                    }
+                }
+            };
+            xhr.send();
+        }
+
+        function verifyActiveApiConnection() {
+            if (availableModels.length === 0) return false;
+            var idx = Math.min(currentModelIndex, availableModels.length - 1);
+            var active = availableModels[idx];
+            if (active.provider === "gemini" && (!geminiApiKey || geminiApiKey.trim() === "")) {
+                apiWarningBanner = "⚠ CHƯA CÓ GEMINI API KEY: Hãy mở [⚙ Cài đặt] để nhập hoặc dán khóa.";
+                return false;
+            }
+            if (active.provider === "claude" && (!anthropicApiKey || anthropicApiKey.trim() === "")) {
+                apiWarningBanner = "⚠ CHƯA CÓ CLAUDE API KEY: Hãy mở [⚙ Cài đặt] để nhập hoặc dán khóa.";
+                return false;
+            }
+            if (active.provider === "openai" && (!openaiApiKey || openaiApiKey.trim() === "")) {
+                apiWarningBanner = "⚠ CHƯA CÓ OPENAI API KEY: Hãy mở [⚙ Cài đặt] để nhập hoặc dán khóa.";
+                return false;
+            }
+            apiWarningBanner = "";
+            return true;
+        }
+
+        function fetchAllAvailableModels() {
+            if (isFetchingModels) return;
+            isFetchingModels = true;
+            modelSyncStatus = "Đang kết nối API để lấy danh sách Models mới nhất...";
+
+            var previousEnabledMap = {};
+            for (var p = 0; p < allModelsMaster.length; p++) {
+                previousEnabledMap[allModelsMaster[p].id] = allModelsMaster[p].enabled;
+            }
+
+            var fetchedList = [];
+            var pendingRequests = 0;
+            var providerCounts = { "gemini": 0, "claude": 0, "openai": 0 };
+
+            function checkAllFinished() {
+                if (pendingRequests <= 0) {
+                    isFetchingModels = false;
+                    if (fetchedList.length > 0) {
+                        allModelsMaster = fetchedList;
+                        rebuildActiveAndFilteredModels();
+                        modelSyncStatus = "✓ Đã tải " + fetchedList.length + " models (Gemini: " + providerCounts.gemini + ", Claude: " + providerCounts.claude + ", OpenAI: " + providerCounts.openai + ")";
+                        showToast("✓ Đã cập nhật " + fetchedList.length + " models từ API!");
+                    } else {
+                        modelSyncStatus = "⚠ Không lấy được danh sách mới (Kiểm tra Wi-Fi hoặc API Key).";
+                        showToast("⚠ Không lấy được danh sách Models mới!");
+                    }
+                    verifyActiveApiConnection();
+                }
+            }
+
+            if (geminiApiKey && cleanKeyString(geminiApiKey) !== "") {
+                pendingRequests++;
+                var xhrGem = new XMLHttpRequest();
+                xhrGem.open("GET", "https://generativelanguage.googleapis.com/v1beta/models?key=" + cleanKeyString(geminiApiKey), true);
+                xhrGem.onreadystatechange = function() {
+                    if (xhrGem.readyState === XMLHttpRequest.DONE) {
+                        if (xhrGem.status === 200) {
+                            try {
+                                var res = JSON.parse(xhrGem.responseText);
+                                var models = res.models || [];
+                                for (var i = 0; i < models.length; i++) {
+                                    var m = models[i];
+                                    var methods = m.supportedGenerationMethods || [];
+                                    var supportsGen = false;
+                                    for (var k = 0; k < methods.length; k++) {
+                                        if (methods[k] === "generateContent") supportsGen = true;
+                                    }
+                                    var rawId = (m.name || "").replace("models/", "").trim();
+                                    if (supportsGen && rawId.indexOf("gemini") === 0 && rawId.indexOf("vision") === -1 && rawId.indexOf("embedding") === -1) {
+                                        var isFreeTier = (rawId.indexOf("flash") !== -1);
+                                        var isEn = (previousEnabledMap[rawId] !== undefined) ? previousEnabledMap[rawId] : true;
+                                        var hwMaxOut = m.outputTokenLimit || 8192;
+                                        var baseLowOut = hwMaxOut >> 2;
+                                        if (baseLowOut < 2048) baseLowOut = 2048;
+                                        fetchedList.push({
+                                            "label": (m.displayName || rawId) + (isFreeTier ? " (Free)" : ""),
+                                            "provider": "gemini",
+                                            "id": rawId,
+                                            "isFree": isFreeTier,
+                                            "enabled": isEn,
+                                            "maxOutputTokens": baseLowOut
+                                        });
+                                        providerCounts.gemini++;
+                                    }
+                                }
+                            } catch (e) {}
+                        }
+                        pendingRequests--;
+                        checkAllFinished();
+                    }
+                };
+                xhrGem.send();
+            }
+
+            if (anthropicApiKey && cleanKeyString(anthropicApiKey) !== "") {
+                pendingRequests++;
+                var xhrCla = new XMLHttpRequest();
+                xhrCla.open("GET", "https://api.anthropic.com/v1/models", true);
+                xhrCla.setRequestHeader("x-api-key", cleanKeyString(anthropicApiKey));
+                xhrCla.setRequestHeader("anthropic-version", "2023-06-01");
+                xhrCla.onreadystatechange = function() {
+                    if (xhrCla.readyState === XMLHttpRequest.DONE) {
+                        if (xhrCla.status === 200) {
+                            try {
+                                var res = JSON.parse(xhrCla.responseText);
+                                var data = res.data || [];
+                                for (var i = 0; i < data.length; i++) {
+                                    var cm = data[i];
+                                    if (cm.id && cm.id.indexOf("claude") === 0) {
+                                        var cid = cm.id.trim();
+                                        var isHaiku = (cid.indexOf("haiku") !== -1);
+                                        var isEn = (previousEnabledMap[cid] !== undefined) ? previousEnabledMap[cid] : true;
+                                        fetchedList.push({
+                                            "label": cm.display_name || cid,
+                                            "provider": "claude",
+                                            "id": cid,
+                                            "isFree": isHaiku,
+                                            "enabled": isEn,
+                                            "maxOutputTokens": 2048
+                                        });
+                                        providerCounts.claude++;
+                                    }
+                                }
+                            } catch (e) {}
+                        }
+                        pendingRequests--;
+                        checkAllFinished();
+                    }
+                };
+                xhrCla.send();
+            }
+
+            if (openaiApiKey && cleanKeyString(openaiApiKey) !== "") {
+                pendingRequests++;
+                var xhrOai = new XMLHttpRequest();
+                xhrOai.open("GET", "https://api.openai.com/v1/models", true);
+                xhrOai.setRequestHeader("Authorization", "Bearer " + cleanKeyString(openaiApiKey));
+                xhrOai.onreadystatechange = function() {
+                    if (xhrOai.readyState === XMLHttpRequest.DONE) {
+                        if (xhrOai.status === 200) {
+                            try {
+                                var res = JSON.parse(xhrOai.responseText);
+                                var data = res.data || [];
+                                for (var i = 0; i < data.length; i++) {
+                                    var oid = (data[i].id || "").trim();
+                                    var isChatModel = (oid.indexOf("gpt-4") === 0 || oid.indexOf("gpt-3.5") === 0 || oid.indexOf("o1") === 0 || oid.indexOf("o3") === 0 || oid.indexOf("o4") === 0 || oid.indexOf("chatgpt-") === 0);
+                                    var isExcluded = (oid.indexOf("audio") !== -1 || oid.indexOf("realtime") !== -1 || oid.indexOf("tts") !== -1 || oid.indexOf("transcribe") !== -1 || oid.indexOf("embedding") !== -1 || oid.indexOf("instruct") !== -1 || oid.indexOf("vision") !== -1);
+                                    if (isChatModel && !isExcluded) {
+                                        var isMini = (oid.indexOf("mini") !== -1 || oid.indexOf("nano") !== -1);
+                                        var isEn = (previousEnabledMap[oid] !== undefined) ? previousEnabledMap[oid] : true;
+                                        fetchedList.push({
+                                            "label": "OpenAI: " + oid,
+                                            "provider": "openai",
+                                            "id": oid,
+                                            "isFree": isMini,
+                                            "enabled": isEn,
+                                            "maxOutputTokens": 1500
+                                        });
+                                        providerCounts.openai++;
+                                    }
+                                }
+                            } catch (e) {}
+                        }
+                        pendingRequests--;
+                        checkAllFinished();
+                    }
+                };
+                xhrOai.send();
+            }
+
+            if (pendingRequests === 0) {
+                isFetchingModels = false;
+                modelSyncStatus = "⚠ Vui lòng nhập ít nhất 1 API Key (Gemini / Claude / OpenAI) trước khi quét Models.";
+                showToast("⚠ Chưa có API Key để quét Models!");
+            }
+        }
+
+        // =========================================================================
+        // BỘ GÕ TIẾNG VIỆT UNIKEY TELEX ENGINE + BỎ DẤU HAI LẦN VỀ TIẾNG ANH
+        // =========================================================================
+        property var telexVowelTable: [
+            ["a", "á", "à", "ả", "ã", "ạ"],
+            ["ă", "ắ", "ằ", "ẳ", "ẵ", "ặ"],
+            ["â", "ấ", "ầ", "ẩ", "ẫ", "ậ"],
+            ["e", "é", "è", "ẻ", "ẽ", "ẹ"],
+            ["ê", "ế", "ề", "ể", "ễ", "ệ"],
+            ["i", "í", "ì", "ỉ", "ĩ", "ị"],
+            ["o", "ó", "ò", "ỏ", "õ", "ọ"],
+            ["ô", "ố", "ồ", "ổ", "ỗ", "ộ"],
+            ["ơ", "ớ", "ờ", "ở", "ỡ", "ợ"],
+            ["u", "ú", "ù", "ủ", "ũ", "ụ"],
+            ["ư", "ứ", "ừ", "ử", "ữ", "ự"],
+            ["y", "ý", "ỳ", "ỷ", "ỹ", "ỵ"]
+        ]
+
+        function getVowelInfo(ch) {
+            var fixedU = ["u", "ú", "ù", "ủ", "ũ", "ụ"];
+            for (var r = 0; r < telexVowelTable.length; r++) {
+                var row = (r === 9) ? fixedU : telexVowelTable[r];
+                for (var t = 0; t < 6; t++) {
+                    if (row[t] === ch) return { baseIdx: r, tone: t, isUpper: false };
+                    if (row[t].toUpperCase() === ch) return { baseIdx: r, tone: t, isUpper: true };
+                }
+            }
+            return null;
+        }
+
+        function makeVowelChar(baseIdx, tone, isUpper) {
+            var fixedU = ["u", "ú", "ù", "ủ", "ũ", "ụ"];
+            var row = (baseIdx === 9) ? fixedU : telexVowelTable[baseIdx];
+            var ch = row[tone];
+            return isUpper ? ch.toUpperCase() : ch;
+        }
+
+        function isModifiedBase(baseIdx) {
+            return (baseIdx === 1 || baseIdx === 2 || baseIdx === 4 || baseIdx === 7 || baseIdx === 8 || baseIdx === 10);
+        }
+
+        function repositionWordTone(chars, tones, targetTone) {
+            var vIndices = [];
+            for (var i = 0; i < chars.length; i++) {
+                var info = getVowelInfo(chars[i]);
+                if (info !== null) {
+                    if (i === 1 && info.baseIdx === 9 && (chars[0] === "q" || chars[0] === "Q")) {
+                        if (i + 1 < chars.length && getVowelInfo(chars[i + 1]) !== null) continue;
+                    }
+                    if (i === 1 && info.baseIdx === 5 && (chars[0] === "g" || chars[0] === "G")) {
+                        if (i + 1 < chars.length && getVowelInfo(chars[i + 1]) !== null) continue;
+                    }
+                    vIndices.push(i);
+                }
+            }
+            if (vIndices.length === 0) return false;
+
+            for (var j = 0; j < vIndices.length; j++) {
+                var idx = vIndices[j];
+                var vInfo = getVowelInfo(chars[idx]);
+                chars[idx] = makeVowelChar(vInfo.baseIdx, 0, vInfo.isUpper);
+            }
+
+            if (targetTone === 0) return true;
+
+            var chosenPos = vIndices[0];
+            if (vIndices.length === 1) {
+                chosenPos = vIndices[0];
+            } else {
+                var modPositions = [];
+                for (var m = 0; m < vIndices.length; m++) {
+                    var mInfo = getVowelInfo(chars[vIndices[m]]);
+                    if (isModifiedBase(mInfo.baseIdx)) modPositions.push(vIndices[m]);
+                }
+                if (modPositions.length > 0) {
+                    chosenPos = modPositions[modPositions.length - 1];
+                } else if (vIndices.length === 2) {
+                    var v0 = getVowelInfo(chars[vIndices[0]]).baseIdx;
+                    var v1 = getVowelInfo(chars[vIndices[1]]).baseIdx;
+                    var hasEndingConsonant = (vIndices[1] < chars.length - 1);
+                    if (v0 === 9 && v1 === 11) {
+                        chosenPos = vIndices[1];
+                    } else if (hasEndingConsonant) {
+                        chosenPos = vIndices[1];
+                    } else if ((v0 === 6 && (v1 === 0 || v1 === 3)) || (v0 === 9 && v1 === 4)) {
+                        chosenPos = vIndices[1];
+                    } else {
+                        chosenPos = vIndices[0];
+                    }
+                } else {
+                    chosenPos = vIndices[1];
+                }
+            }
+
+            var targetInfo = getVowelInfo(chars[chosenPos]);
+            chars[chosenPos] = makeVowelChar(targetInfo.baseIdx, targetTone, targetInfo.isUpper);
+            return true;
+        }
+
+        function processWordWithUniKeyTelex(word, keyChar) {
+            var lowerKey = keyChar.toLowerCase();
+            var isKeyUpper = (keyChar !== lowerKey);
+            var chars = word.split("");
+
+            var currentWordTone = 0;
+            for (var i = 0; i < chars.length; i++) {
+                var vi = getVowelInfo(chars[i]);
+                if (vi !== null && vi.tone !== 0) {
+                    currentWordTone = vi.tone;
+                    chars[i] = makeVowelChar(vi.baseIdx, 0, vi.isUpper);
+                }
+            }
+
+            if (lowerKey === "d" && chars.length >= 1) {
+                var lastIdx = chars.length - 1;
+                if (chars[lastIdx] === "d" || chars[lastIdx] === "D") {
+                    chars[lastIdx] = (chars[lastIdx] === "D") ? "Đ" : "đ";
+                    repositionWordTone(chars, null, currentWordTone);
+                    return chars.join("");
+                }
+                if (chars[lastIdx] === "đ" || chars[lastIdx] === "Đ") {
+                    chars[lastIdx] = (chars[lastIdx] === "Đ") ? "D" : "d";
+                    chars.push(keyChar);
+                    repositionWordTone(chars, null, currentWordTone);
+                    return chars.join("");
+                }
+            }
+
+            if (lowerKey === "a" || lowerKey === "e" || lowerKey === "o") {
+                var targetBase = (lowerKey === "a") ? 0 : ((lowerKey === "e") ? 3 : 6);
+                var circumflexBase = (lowerKey === "a") ? 2 : ((lowerKey === "e") ? 4 : 7);
+                for (var c = chars.length - 1; c >= 0; c--) {
+                    var cInfo = getVowelInfo(chars[c]);
+                    if (cInfo !== null) {
+                        if (cInfo.baseIdx === circumflexBase) {
+                            chars[c] = makeVowelChar(targetBase, 0, cInfo.isUpper);
+                            chars.push(keyChar);
+                            repositionWordTone(chars, null, currentWordTone);
+                            return chars.join("");
+                        }
+                        if (cInfo.baseIdx === targetBase) {
+                            chars[c] = makeVowelChar(circumflexBase, 0, cInfo.isUpper);
+                            repositionWordTone(chars, null, currentWordTone);
+                            return chars.join("");
+                        }
+                    }
+                }
+            }
+
+            if (lowerKey === "w") {
+                if (chars.length >= 1) {
+                    var lastV = getVowelInfo(chars[chars.length - 1]);
+                    if (lastV !== null && lastV.baseIdx === 10) {
+                        var prevIsU = (chars.length >= 2 && (chars[chars.length - 2].toLowerCase() === "u"));
+                        if (!prevIsU) {
+                            chars[chars.length - 1] = lastV.isUpper ? "W" : "w";
+                            repositionWordTone(chars, null, currentWordTone);
+                            return chars.join("");
+                        }
+                    }
+                }
+
+                for (var m = chars.length - 1; m >= 0; m--) {
+                    var mv = getVowelInfo(chars[m]);
+                    if (mv !== null && (mv.baseIdx === 1 || mv.baseIdx === 8 || mv.baseIdx === 10)) {
+                        var origBase = (mv.baseIdx === 1) ? 0 : ((mv.baseIdx === 8) ? 6 : 9);
+                        chars[m] = makeVowelChar(origBase, 0, mv.isUpper);
+                        if (m >= 1) {
+                            var prevU = getVowelInfo(chars[m - 1]);
+                            if (prevU !== null && prevU.baseIdx === 10) {
+                                chars[m - 1] = makeVowelChar(9, 0, prevU.isUpper);
+                            }
+                        }
+                        chars.push(keyChar);
+                        repositionWordTone(chars, null, currentWordTone);
+                        return chars.join("");
+                    }
+                }
+
+                for (var u = 0; u < chars.length - 1; u++) {
+                    var uInfo = getVowelInfo(chars[u]);
+                    var oInfo = getVowelInfo(chars[u + 1]);
+                    if (uInfo !== null && oInfo !== null && (uInfo.baseIdx === 9 || uInfo.baseIdx === 10) && (oInfo.baseIdx === 6 || oInfo.baseIdx === 7 || oInfo.baseIdx === 8)) {
+                        var isQuPrefix = (u === 1 && (chars[0] === "q" || chars[0] === "Q"));
+                        if (!isQuPrefix) {
+                            chars[u] = makeVowelChar(10, 0, uInfo.isUpper);
+                            chars[u + 1] = makeVowelChar(8, 0, oInfo.isUpper);
+                            repositionWordTone(chars, null, currentWordTone);
+                            return chars.join("");
+                        }
+                    }
+                }
+
+                for (var k = chars.length - 1; k >= 0; k--) {
+                    var kv = getVowelInfo(chars[k]);
+                    if (kv !== null) {
+                        if (kv.baseIdx === 0) {
+                            chars[k] = makeVowelChar(1, 0, kv.isUpper);
+                            repositionWordTone(chars, null, currentWordTone);
+                            return chars.join("");
+                        }
+                        if (kv.baseIdx === 6 || kv.baseIdx === 7) {
+                            chars[k] = makeVowelChar(8, 0, kv.isUpper);
+                            repositionWordTone(chars, null, currentWordTone);
+                            return chars.join("");
+                        }
+                        if (kv.baseIdx === 9) {
+                            chars[k] = makeVowelChar(10, 0, kv.isUpper);
+                            repositionWordTone(chars, null, currentWordTone);
+                            return chars.join("");
+                        }
+                    }
+                }
+
+                var newU = isKeyUpper ? "Ư" : "ư";
+                chars.push(newU);
+                repositionWordTone(chars, null, currentWordTone);
+                return chars.join("");
+            }
+
+            var toneMap = { "z": 0, "s": 1, "f": 2, "r": 3, "x": 4, "j": 5 };
+            if (toneMap[lowerKey] !== undefined && chars.length >= 1) {
+                var hasAnyVowel = false;
+                for (var v = 0; v < chars.length; v++) {
+                    if (getVowelInfo(chars[v]) !== null) { hasAnyVowel = true; break; }
+                }
+                if (hasAnyVowel) {
+                    var desiredTone = toneMap[lowerKey];
+                    if (desiredTone === 0) {
+                        if (currentWordTone === 0) {
+                            chars.push(keyChar);
+                            return chars.join("");
+                        }
+                        repositionWordTone(chars, null, 0);
+                        return chars.join("");
+                    }
+                    if (currentWordTone === desiredTone) {
+                        repositionWordTone(chars, null, 0);
+                        chars.push(keyChar);
+                        return chars.join("");
+                    }
+                    repositionWordTone(chars, null, desiredTone);
+                    return chars.join("");
+                }
+            }
+
+            chars.push(keyChar);
+            if (currentWordTone !== 0) {
+                repositionWordTone(chars, null, currentWordTone);
+            }
+            return chars.join("");
+        }
+
+        function applyVietnameseTelex(currentText, keyChar) {
+            if (!telexEnabled) return currentText + keyChar;
+
+            var splitPos = -1;
+            for (var i = currentText.length - 1; i >= 0; i--) {
+                var c = currentText.charAt(i);
+                if (" \n\t.,!?;:()[]{}\"'/-+@#$%^&=<>~`|\\0123456789".indexOf(c) !== -1) {
+                    splitPos = i;
+                    break;
+                }
+            }
+            var prefix = currentText.slice(0, splitPos + 1);
+            var activeWord = currentText.slice(splitPos + 1);
+            return prefix + processWordWithUniKeyTelex(activeWord, keyChar);
+        }
+
+        function handleVirtualKeyPress(k) {
+            suppressSystemKeyboard();
+            var targetStr = currentDraftText;
+            if (activeKeyField === 1) targetStr = geminiApiKey;
+            else if (activeKeyField === 2) targetStr = anthropicApiKey;
+            else if (activeKeyField === 3) targetStr = openaiApiKey;
+            else if (activeKeyField === 4) targetStr = modelSearchQuery;
+
+            if (k === "BACKSPACE") {
+                if (targetStr.length > 0) targetStr = targetStr.slice(0, targetStr.length - 1);
+            } else if (k === "SPACE") {
+                targetStr = targetStr + " ";
+            } else if (k === "SHIFT") {
+                shiftActive = !shiftActive;
+                return;
+            } else if (k === "TELEX") {
+                telexEnabled = !telexEnabled;
+                return;
+            } else if (k === "SYM_TOGGLE") {
+                symbolPageActive = !symbolPageActive;
+                return;
+            } else if (k === "CLEAR") {
+                targetStr = "";
+            } else {
+                var outChar = k;
+                if (!symbolPageActive && k.length === 1 && k.toLowerCase() !== k.toUpperCase()) {
+                    outChar = shiftActive ? k.toUpperCase() : k.toLowerCase();
+                }
+                if ((activeKeyField === 0 || activeKeyField === 4) && !symbolPageActive && outChar.toLowerCase() !== outChar.toUpperCase()) {
+                    targetStr = applyVietnameseTelex(targetStr, outChar);
+                } else {
+                    targetStr = targetStr + outChar;
+                }
+                if (shiftActive) shiftActive = false;
+            }
+
+            if (activeKeyField === 0) currentDraftText = targetStr;
+            else if (activeKeyField === 1) { geminiApiKey = cleanKeyString(targetStr); verifyActiveApiConnection(); }
+            else if (activeKeyField === 2) { anthropicApiKey = cleanKeyString(targetStr); verifyActiveApiConnection(); }
+            else if (activeKeyField === 3) { openaiApiKey = cleanKeyString(targetStr); verifyActiveApiConnection(); }
+            else if (activeKeyField === 4) { modelSearchQuery = targetStr; rebuildActiveAndFilteredModels(); }
+        }
+
+        function pasteFromClipboardToField(fieldIdx) {
+            hiddenClipboardBridge.text = "";
+            hiddenClipboardBridge.paste();
+            var clip = (hiddenClipboardBridge.text || "").trim();
+            if (clip === "") { showToast("Clipboard đang trống!"); return; }
+            if (fieldIdx === 1) geminiApiKey = cleanKeyString(clip);
+            else if (fieldIdx === 2) anthropicApiKey = cleanKeyString(clip);
+            else if (fieldIdx === 3) openaiApiKey = cleanKeyString(clip);
+            else if (fieldIdx === 4) { modelSearchQuery = clip; rebuildActiveAndFilteredModels(); }
+            else currentDraftText = currentDraftText + clip;
+            verifyActiveApiConnection();
+            showToast("✓ Đã dán nội dung từ Clipboard!");
+        }
+
+        function isQuotaOrTokenExhausted(httpStatus, responseBody) {
+            if (httpStatus === 429 || httpStatus === 402) return true;
+            var lower = (responseBody || "").toLowerCase();
+            return (lower.indexOf("quota") !== -1 ||
+                    lower.indexOf("rate_limit") !== -1 ||
+                    lower.indexOf("insufficient") !== -1 ||
+                    lower.indexOf("credit balance") !== -1 ||
+                    lower.indexOf("resource_exhausted") !== -1 ||
+                    lower.indexOf("billing") !== -1);
+        }
+
+        function findAvailableFreeModelIndex(failedModelIdx) {
+            for (var i = 0; i < availableModels.length; i++) {
+                if (i !== failedModelIdx && availableModels[i].isFree) {
+                    var p = availableModels[i].provider;
+                    if (p === "gemini" && geminiApiKey.trim() !== "") return i;
+                    if (p === "openai" && openaiApiKey.trim() !== "") return i;
+                    if (p === "claude" && anthropicApiKey.trim() !== "") return i;
+                }
+            }
+            return -1;
+        }
+
+        Timer {
+            id: toastClearTimer
+            interval: 4000; repeat: false
+            onTriggered: { aiOverlayRoot.saveStatusToast = ""; }
+        }
+
+        // Bộ hẹn giờ ngắt an toàn khi mạng chập chờn (Chống treo luồng truyền tải)
+        Timer {
+            id: requestSafetyTimeoutTimer
+            interval: 60000; repeat: false
+            onTriggered: {
+                if (aiOverlayRoot.isSending && aiOverlayRoot.activeXhrRequest) {
+                    try { aiOverlayRoot.activeXhrRequest.abort(); } catch (e) {}
+                    aiOverlayRoot.isSending = false;
+                    aiOverlayRoot.showToast("⚠ Quá thời gian phản hồi (60s). Vui lòng thử lại!");
+                }
+            }
+        }
+
+        function showToast(msg) {
+            aiOverlayRoot.saveStatusToast = msg;
+            toastClearTimer.restart();
+        }
+
+        function copyTextToClipboard(textToCopy, closeAfterCopy) {
+            if (!textToCopy) return;
+            hiddenClipboardBridge.text = textToCopy;
+            hiddenClipboardBridge.selectAll();
+            hiddenClipboardBridge.copy();
+            if (closeAfterCopy) {
+                aiOverlayRoot.chatVisible = false;
+                aiOverlayRoot.modelMenuVisible = false;
+                aiOverlayRoot.saveMenuVisible = false;
+                aiOverlayRoot.settingsPageVisible = false;
+                aiOverlayRoot.notebookPageVisible = false;
+            } else {
+                showToast("✓ Đã chép vào Clipboard!");
+            }
+        }
+
+        Timer {
+            id: selectionWatcher
+            interval: 350; running: !aiOverlayRoot.chatVisible; repeat: true
+            onTriggered: aiOverlayRoot.detectSelectionAndMenu()
+        }
+
+        function detectSelectionAndMenu() {
+            var activeText = "";
+            var menuDetected = false;
+            var targetX = aiOverlayRoot.popupAnchorX;
+            var targetY = aiOverlayRoot.popupAnchorY;
+
+            function scanTree(item, depth) {
+                if (!item || depth > 9 || item === aiOverlayRoot) return;
+                try {
+                    if (item.selectedText && typeof item.selectedText === "string" && item.selectedText.trim() !== "") {
+                        activeText = item.selectedText.trim();
+                    }
+                    if (item.visible && item.width >= 110 && item.width <= 620 && item.height >= 48 && item.height <= 115) {
+                        var pos = item.mapToItem(aiOverlayRoot, 0, 0);
+                        if (pos.y > 90 && pos.y < (aiOverlayRoot.height - 100) && pos.x > 60) {
+                            var strName = item.toString();
+                            if (strName.indexOf("Selection") !== -1 || strName.indexOf("Menu") !== -1 || strName.indexOf("Popup") !== -1 || strName.indexOf("Toolbar") !== -1 || activeText !== "") {
+                                menuDetected = true;
+                                targetX = Math.max(20, Math.min(aiOverlayRoot.width - 420, pos.x));
+                                targetY = (pos.y + item.height + 80 < aiOverlayRoot.height) ? (pos.y + item.height + 10) : (pos.y - 74);
+                            }
+                        }
+                    }
+                } catch (e) {}
+                if (item.children) {
+                    for (var i = 0; i < item.children.length; i++) scanTree(item.children[i], depth + 1);
+                }
+            }
+            scanTree(aiOverlayRoot.parent, 0);
+            if (activeText !== "") {
+                aiOverlayRoot.quotedSelection = activeText;
+                aiOverlayRoot.selectionMenuActive = true;
+                aiOverlayRoot.popupAnchorX = targetX;
+                aiOverlayRoot.popupAnchorY = targetY;
+            } else if (menuDetected) {
+                aiOverlayRoot.selectionMenuActive = true;
+                aiOverlayRoot.popupAnchorX = targetX;
+                aiOverlayRoot.popupAnchorY = targetY;
+            } else {
+                aiOverlayRoot.selectionMenuActive = false;
+            }
+        }
+
+        function grabHighlightedText() {
+            var foundText = "";
+            function scanNode(item, depth) {
+                if (!item || depth > 8 || foundText !== "" || item === aiOverlayRoot) return;
+                try {
+                    if (item.selectedText && typeof item.selectedText === "string" && item.selectedText.trim() !== "") {
+                        foundText = item.selectedText.trim();
+                        return;
+                    }
+                    if (typeof item.copySelectionToClipboard === "function") item.copySelectionToClipboard();
+                } catch (e) {}
+                if (item.children) {
+                    for (var i = 0; i < item.children.length; i++) scanNode(item.children[i], depth + 1);
+                }
+            }
+            scanNode(aiOverlayRoot.parent, 0);
+            if (foundText === "") {
+                hiddenClipboardBridge.text = "";
+                hiddenClipboardBridge.paste();
+                if (hiddenClipboardBridge.text) foundText = hiddenClipboardBridge.text.trim();
+            }
+            if (foundText !== "") quotedSelection = foundText;
+        }
+
+        function triggerFromContextMenu(autoPrompt) {
+            suppressSystemKeyboard();
+            loadApiKeysDirectlyFromTxt(false);
+            grabHighlightedText();
+            selectionMenuActive = false;
+            chatVisible = true;
+            settingsPageVisible = false;
+            notebookPageVisible = false;
+            modelMenuVisible = false;
+            saveMenuVisible = false;
+            activeKeyField = 0;
+            if (autoPrompt) sendPrompt(autoPrompt, false);
+        }
+
+        function buildValidClaudeMessages() {
+            var validMsgs = [];
+            for (var i = 0; i < conversationHistory.length; i++) {
+                var r = (conversationHistory[i].role === "assistant") ? "assistant" : "user";
+                var txt = (conversationHistory[i].text || "").trim();
+                if (txt === "") continue;
+                if (validMsgs.length === 0 && r !== "user") continue;
+
+                if (validMsgs.length > 0 && validMsgs[validMsgs.length - 1].role === r) {
+                    validMsgs[validMsgs.length - 1].content = validMsgs[validMsgs.length - 1].content + "\n\n" + txt;
+                } else {
+                    validMsgs.push({ "role": r, "content": txt });
+                }
+            }
+            return validMsgs;
+        }
+
+        function sendPrompt(userPrompt, isRetryAfterFallback) {
+            suppressSystemKeyboard();
+            if (!isRetryAfterFallback) {
+                if ((!userPrompt || userPrompt.trim() === "") && quotedSelection === "") return;
+                if (isSending) return;
+            }
+
+            if (!verifyActiveApiConnection()) {
+                chatLogModel.append({
+                    "sender": "Cảnh báo kết nối API",
+                    "msgText": apiWarningBanner,
+                    "copied": false
+                });
+                chatListView.positionViewAtEnd();
+                return;
+            }
+
+            isSending = true;
+            modelMenuVisible = false;
+            saveMenuVisible = false;
+
+            var activeModel = availableModels[currentModelIndex];
+            var dynamicMaxTokens = computeEffectiveMaxTokens(activeModel);
+            var effectiveSysPrompt = buildEffectiveSystemInstruction();
+
+            if (!isRetryAfterFallback) {
+                var finalPrompt = userPrompt ? userPrompt.trim() : "Hãy giải thích đoạn văn bản này.";
+                if (quotedSelection !== "") {
+                    finalPrompt = "Đoạn văn bản trích từ sách:\n\"\"\"\n" + quotedSelection + "\n\"\"\"\n\nYêu cầu: " + finalPrompt;
+                    quotedSelection = "";
+                }
+                conversationHistory.push({ "role": "user", "text": finalPrompt });
+                chatLogModel.append({ "sender": "Bạn", "msgText": finalPrompt, "copied": false });
+                currentDraftText = "";
+            }
+
+            var xhr = new XMLHttpRequest();
+            activeXhrRequest = xhr;
+            requestSafetyTimeoutTimer.restart();
+
+            function handleApiErrorAndFallback(status, responseText) {
+                requestSafetyTimeoutTimer.stop();
+                isSending = false;
+                if (status === 0) {
+                    apiWarningBanner = "⚠ MẤT KẾT NỐI MẠNG: Vui lòng kiểm tra Wi-Fi trên reMarkable.";
+                    chatLogModel.append({ "sender": "Lỗi mạng", "msgText": apiWarningBanner, "copied": false });
+                    chatListView.positionViewAtEnd();
+                    return;
+                }
+
+                if (!isRetryAfterFallback && !activeModel.isFree && isQuotaOrTokenExhausted(status, responseText)) {
+                    var freeIdx = findAvailableFreeModelIndex(currentModelIndex);
+                    if (freeIdx !== -1) {
+                        var oldLabel = activeModel.label;
+                        var newLabel = availableModels[freeIdx].label;
+                        currentModelIndex = freeIdx;
+                        tokenWarningBanner = "⚠ HẾT TOKEN: [" + oldLabel + "] đã hết hạn mức. Đã tự động chuyển sang [" + newLabel + "]!";
+                        chatLogModel.append({
+                            "sender": "Hệ thống (Auto-Fallback)",
+                            "msgText": tokenWarningBanner + " Đang gửi lại câu hỏi...",
+                            "copied": false
+                        });
+                        chatListView.positionViewAtEnd();
+                        sendPrompt("", true);
+                        return;
+                    }
+                }
+
+                var errDetail = responseText || "Vui lòng mở [⚙ Cài đặt] và kiểm tra lại API Key.";
+                try {
+                    var parsedErr = JSON.parse(responseText);
+                    if (parsedErr.error && parsedErr.error.message) {
+                        errDetail = parsedErr.error.message;
+                    }
+                } catch (e) {}
+
+                chatLogModel.append({
+                    "sender": "Lỗi " + activeModel.label + " (" + status + ")",
+                    "msgText": errDetail,
+                    "copied": false
+                });
+                chatListView.positionViewAtEnd();
+            }
+
+            if (activeModel.provider === "claude") {
+                xhr.open("POST", "https://api.anthropic.com/v1/messages", true);
+                xhr.setRequestHeader("Content-Type", "application/json; charset=utf-8");
+                xhr.setRequestHeader("x-api-key", cleanKeyString(anthropicApiKey));
+                xhr.setRequestHeader("anthropic-version", "2023-06-01");
+
+                var claudeMsgs = buildValidClaudeMessages();
+
+                xhr.onreadystatechange = function() {
+                    if (xhr.readyState === XMLHttpRequest.DONE) {
+                        requestSafetyTimeoutTimer.stop();
+                        if (xhr.status === 200) {
+                            isSending = false;
+                            try {
+                                var res = JSON.parse(xhr.responseText);
+                                var reply = "";
+                                if (res.content && res.content.length > 0) {
+                                    for (var c = 0; c < res.content.length; c++) {
+                                        if (res.content[c].text) {
+                                            reply += res.content[c].text;
+                                        }
+                                    }
+                                }
+                                if (reply === "") reply = "(Claude trả về phản hồi trống)";
+                                conversationHistory.push({ "role": "assistant", "text": reply });
+                                chatLogModel.append({ "sender": activeModel.label, "msgText": reply, "copied": false });
+                                saveCurrentChatToQMLNotebook(true);
+                            } catch (e) {
+                                chatLogModel.append({ "sender": "Hệ thống", "msgText": "Lỗi phân tích JSON từ Claude.", "copied": false });
+                            }
+                            chatListView.positionViewAtEnd();
+                        } else {
+                            handleApiErrorAndFallback(xhr.status, xhr.responseText);
+                        }
+                    }
+                };
+                xhr.send(JSON.stringify({
+                    "model": activeModel.id.trim(),
+                    "max_tokens": dynamicMaxTokens,
+                    "system": effectiveSysPrompt,
+                    "messages": claudeMsgs
+                }));
+
+            } else if (activeModel.provider === "gemini") {
+                var geminiUrl = "https://generativelanguage.googleapis.com/v1beta/models/" + activeModel.id.trim() + ":generateContent?key=" + cleanKeyString(geminiApiKey);
+                xhr.open("POST", geminiUrl, true);
+                xhr.setRequestHeader("Content-Type", "application/json; charset=utf-8");
+
+                var geminiContents = [];
+                for (var j = 0; j < conversationHistory.length; j++) {
+                    var gRole = conversationHistory[j].role === "assistant" ? "model" : "user";
+                    var gTxt = (conversationHistory[j].text || "").trim();
+                    if (gTxt === "") continue;
+                    if (geminiContents.length > 0 && geminiContents[geminiContents.length - 1].role === gRole) {
+                        geminiContents[geminiContents.length - 1].parts[0].text += "\n\n" + gTxt;
+                    } else {
+                        geminiContents.push({ "role": gRole, "parts": [{ "text": gTxt }] });
+                    }
+                }
+
+                xhr.onreadystatechange = function() {
+                    if (xhr.readyState === XMLHttpRequest.DONE) {
+                        requestSafetyTimeoutTimer.stop();
+                        if (xhr.status === 200) {
+                            isSending = false;
+                            try {
+                                var res = JSON.parse(xhr.responseText);
+                                var reply = "";
+                                var partsList = res.candidates[0].content.parts || [];
+                                for (var p = 0; p < partsList.length; p++) {
+                                    if (partsList[p].text) reply += partsList[p].text;
+                                }
+                                conversationHistory.push({ "role": "assistant", "text": reply });
+                                chatLogModel.append({ "sender": activeModel.label, "msgText": reply, "copied": false });
+                                saveCurrentChatToQMLNotebook(true);
+                            } catch (e) {
+                                chatLogModel.append({ "sender": "Hệ thống", "msgText": "Lỗi phân tích JSON từ Gemini.", "copied": false });
+                            }
+                            chatListView.positionViewAtEnd();
+                        } else {
+                            handleApiErrorAndFallback(xhr.status, xhr.responseText);
+                        }
+                    }
+                };
+                xhr.send(JSON.stringify({
+                    "systemInstruction": { "parts": [{ "text": effectiveSysPrompt }] },
+                    "contents": geminiContents,
+                    "generationConfig": { "maxOutputTokens": dynamicMaxTokens }
+                }));
+
+            } else if (activeModel.provider === "openai") {
+                xhr.open("POST", "https://api.openai.com/v1/chat/completions", true);
+                xhr.setRequestHeader("Content-Type", "application/json; charset=utf-8");
+                xhr.setRequestHeader("Authorization", "Bearer " + cleanKeyString(openaiApiKey));
+
+                var oaiMsgs = [{ "role": "system", "content": effectiveSysPrompt }];
+                for (var k = 0; k < conversationHistory.length; k++) {
+                    oaiMsgs.push({ "role": conversationHistory[k].role, "content": conversationHistory[k].text });
+                }
+
+                xhr.onreadystatechange = function() {
+                    if (xhr.readyState === XMLHttpRequest.DONE) {
+                        requestSafetyTimeoutTimer.stop();
+                        if (xhr.status === 200) {
+                            isSending = false;
+                            try {
+                                var res = JSON.parse(xhr.responseText);
+                                var reply = res.choices[0].message.content;
+                                conversationHistory.push({ "role": "assistant", "text": reply });
+                                chatLogModel.append({ "sender": activeModel.label, "msgText": reply, "copied": false });
+                                saveCurrentChatToQMLNotebook(true);
+                            } catch (e) {
+                                chatLogModel.append({ "sender": "Hệ thống", "msgText": "Lỗi phân tích JSON từ OpenAI.", "copied": false });
+                            }
+                            chatListView.positionViewAtEnd();
+                        } else {
+                            handleApiErrorAndFallback(xhr.status, xhr.responseText);
+                        }
+                    }
+                };
+                xhr.send(JSON.stringify({
+                    "model": activeModel.id.trim(),
+                    "messages": oaiMsgs,
+                    "max_tokens": dynamicMaxTokens
+                }));
+            }
+        }
+
+        // Thanh nút nổi khi bôi đen văn bản
+        Rectangle {
+            id: contextSelectionPill
+            visible: aiOverlayRoot.selectionMenuActive && !aiOverlayRoot.chatVisible
+            x: aiOverlayRoot.popupAnchorX; y: aiOverlayRoot.popupAnchorY
+            width: contextRow.implicitWidth + 20; height: 62; radius: 10
+            color: "black"; border.color: "white"; border.width: 2
+
+            Row {
+                id: contextRow; anchors.centerIn: parent; spacing: 8
+                Rectangle {
+                    width: 124; height: 46; radius: 6; color: "white"
+                    Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "✦ Hỏi AI"; color: "black"; font.pixelSize: 20; font.bold: true }
+                    MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.triggerFromContextMenu("") }
+                }
+                Rectangle {
+                    width: 124; height: 46; radius: 6; color: "black"; border.color: "white"; border.width: 2
+                    Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Giải thích"; color: "white"; font.pixelSize: 19; font.bold: true }
+                    MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.triggerFromContextMenu("Hãy giải thích chi tiết và dễ hiểu ý nghĩa của đoạn văn bản này.") }
+                }
+                Rectangle {
+                    width: 110; height: 46; radius: 6; color: "black"; border.color: "white"; border.width: 2
+                    Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Dịch TV"; color: "white"; font.pixelSize: 19; font.bold: true }
+                    MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.triggerFromContextMenu("Dịch đoạn văn bản này sang tiếng Việt tự nhiên, chuẩn thuật ngữ.") }
+                }
+            }
+        }
+
+        // Nút AI cố định góc dưới phải
+        Rectangle {
+            id: toggleBtn
+            width: 84; height: 84; radius: 14
+            color: aiOverlayRoot.chatVisible ? "black" : "white"
+            border.color: "black"; border.width: 3
+            anchors.right: parent.right; anchors.bottom: parent.bottom
+            anchors.rightMargin: 28; anchors.bottomMargin: 28
+
+            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "AI"; font.pixelSize: 28; font.bold: true; color: aiOverlayRoot.chatVisible ? "white" : "black" }
+            MouseArea {
+                anchors.fill: parent
+                onClicked: {
+                    aiOverlayRoot.suppressSystemKeyboard();
+                    aiOverlayRoot.loadApiKeysDirectlyFromTxt(false);
+                    if (!aiOverlayRoot.chatVisible) aiOverlayRoot.grabHighlightedText();
+                    aiOverlayRoot.chatVisible = !aiOverlayRoot.chatVisible;
+                    aiOverlayRoot.modelMenuVisible = false;
+                    aiOverlayRoot.saveMenuVisible = false;
+                }
+            }
+        }
+
+        // CỬA SỔ PHIÊN LÀM VIỆC CHÍNH (Tự động co giãn theo cấu hình thiết bị từ Script cài đặt)
+        Rectangle {
+            id: chatWindow
+            visible: aiOverlayRoot.chatVisible
+            width: Math.min(parent.width - 40, persistentSettings.customWinWidth)
+            height: Math.min(parent.height - 40, persistentSettings.customWinHeight)
+            anchors.centerIn: parent
+            color: "white"; border.color: "black"; border.width: 4; radius: 12
+
+            MouseArea {
+                anchors.fill: parent
+                onClicked: {
+                    aiOverlayRoot.suppressSystemKeyboard();
+                    aiOverlayRoot.modelMenuVisible = false;
+                    aiOverlayRoot.saveMenuVisible = false;
+                }
+            }
+            // Vùng chứa cố định cho các đối tượng Extension (.qml)
+            Item {
+                id: extensionHostContainer
+                anchors.fill: parent
+                z: 95
+            }
+            // THANH HEADER
+            Rectangle {
+                id: headerBar
+                width: parent.width; height: 84; color: "black"; anchors.top: parent.top; z: 20
+
+                // Nút chọn Model
+                Rectangle {
+                    width: 285; height: 54; radius: 8; color: "white"
+                    anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter
+                    Text {
+                        anchors.left: parent.left; anchors.leftMargin: 10; anchors.right: parent.right; anchors.rightMargin: 8
+                        anchors.verticalCenter: parent.verticalCenter
+                        font.family: aiOverlayRoot.vnFont; elide: Text.ElideRight
+                        text: aiOverlayRoot.isSending ? "Đang xử lý..." : ((aiOverlayRoot.availableModels.length > 0 ? aiOverlayRoot.availableModels[aiOverlayRoot.currentModelIndex].label : "Chọn Model") + " ▾")
+                        color: "black"; font.pixelSize: 17; font.bold: true
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            aiOverlayRoot.settingsPageVisible = false;
+                            aiOverlayRoot.notebookPageVisible = false;
+                            aiOverlayRoot.saveMenuVisible = false;
+                            aiOverlayRoot.modelMenuVisible = !aiOverlayRoot.modelMenuVisible;
+                        }
+                    }
+                }
+
+                // Nút mở Sổ tay QML (Xem lại lịch sử ngay trên máy)
+                Rectangle {
+                    width: 140; height: 54; radius: 8
+                    color: aiOverlayRoot.notebookPageVisible ? "#CCCCCC" : "white"
+                    anchors.left: parent.left; anchors.leftMargin: 305; anchors.verticalCenter: parent.verticalCenter
+                    Text {
+                        anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont
+                        text: aiOverlayRoot.notebookPageVisible ? "← Quay lại" : ("📚 Sổ tay (" + savedNotebookModel.count + ")")
+                        font.pixelSize: 17; font.bold: true; color: "black"
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            aiOverlayRoot.modelMenuVisible = false;
+                            aiOverlayRoot.saveMenuVisible = false;
+                            aiOverlayRoot.settingsPageVisible = false;
+                            aiOverlayRoot.selectedNotebookIndex = -1;
+                            aiOverlayRoot.initAndLoadNotebookDB();
+                            aiOverlayRoot.notebookPageVisible = !aiOverlayRoot.notebookPageVisible;
+                        }
+                    }
+                }
+
+                // Nút Cài đặt
+                Rectangle {
+                    width: 135; height: 54; radius: 8
+                    color: aiOverlayRoot.settingsPageVisible ? "#CCCCCC" : "white"
+                    anchors.left: parent.left; anchors.leftMargin: 453; anchors.verticalCenter: parent.verticalCenter
+                    Text {
+                        anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont
+                        text: aiOverlayRoot.settingsPageVisible ? "← Quay lại" : "⚙ Cài đặt"
+                        font.pixelSize: 17; font.bold: true; color: "black"
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            aiOverlayRoot.modelMenuVisible = false;
+                            aiOverlayRoot.saveMenuVisible = false;
+                            aiOverlayRoot.notebookPageVisible = false;
+                            aiOverlayRoot.settingsPageVisible = !aiOverlayRoot.settingsPageVisible;
+                            if (!aiOverlayRoot.settingsPageVisible) aiOverlayRoot.activeKeyField = 0;
+                        }
+                    }
+                }
+
+                // Nút Ẩn/Hiện Bàn phím
+                Rectangle {
+                    width: 135; height: 54; radius: 8
+                    color: aiOverlayRoot.showVirtualKeyboard ? "white" : "#DDDDDD"
+                    anchors.left: parent.left; anchors.leftMargin: 596; anchors.verticalCenter: parent.verticalCenter
+                    Text {
+                        anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont
+                        text: aiOverlayRoot.showVirtualKeyboard ? "⌨ Phím: BẬT" : "⌨ Phím: TẮT"
+                        font.pixelSize: 17; font.bold: true; color: "black"
+                    }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: { aiOverlayRoot.showVirtualKeyboard = !aiOverlayRoot.showVirtualKeyboard; }
+                    }
+                }
+
+                // Nút Dropdown Menu "Tiện ích ▾" (Thay thế nút Lưu / EPUB cũ)
+                Rectangle {
+                    width: 145; height: 54; radius: 8
+                    color: aiOverlayRoot.saveMenuVisible ? "#CCCCCC" : "white"
+                    anchors.right: clearBtn.left; anchors.rightMargin: 8; anchors.verticalCenter: parent.verticalCenter
+                    Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Tiện ích ▾"; font.pixelSize: 17; font.bold: true; color: "black" }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            aiOverlayRoot.modelMenuVisible = false;
+                            aiOverlayRoot.settingsPageVisible = false;
+                            if (!aiOverlayRoot.saveMenuVisible) {
+                                aiOverlayRoot.rebuildUtilityMenuItems();
+                            }
+                            aiOverlayRoot.saveMenuVisible = !aiOverlayRoot.saveMenuVisible;
+                        }
+                    }
+                }
+
+                // Nút Phiên mới
+                Rectangle {
+                    id: clearBtn
+                    width: 104; height: 54; radius: 8; color: "white"
+                    anchors.right: closeBtn.left; anchors.rightMargin: 8; anchors.verticalCenter: parent.verticalCenter
+                    Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Phiên mới"; font.pixelSize: 17; font.bold: true; color: "black" }
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            if (chatLogModel.count > 0) aiOverlayRoot.saveCurrentChatToQMLNotebook(true);
+                            chatLogModel.clear();
+                            aiOverlayRoot.conversationHistory = [];
+                            aiOverlayRoot.tokenWarningBanner = "";
+                            aiOverlayRoot.sessionTitle = "Ghi_chu_AI_" + Qt.formatDateTime(new Date(), "yyyyMMdd_hhmmss");
+                            aiOverlayRoot.showToast("Đã lưu phiên cũ vào Sổ tay & tạo phiên mới!");
+                        }
+                    }
+                }
+
+                // Nút Đóng
+                Rectangle {
+                    id: closeBtn
+                    width: 50; height: 54; radius: 8; color: "white"
+                    anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter
+                    Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "X"; font.pixelSize: 24; font.bold: true; color: "black" }
+                    MouseArea { anchors.fill: parent; onClicked: { aiOverlayRoot.chatVisible = false; aiOverlayRoot.activeKeyField = 0; } }
+                }
+            }
+
+            // =========================================================================
+            // MENU DROPDOWN "TIỆN ÍCH ▾" (DÙNG LISTVIEW PHẲNG GIỐNG HỆT CHỌN MODEL)
+            // =========================================================================
+            Rectangle {
+                id: saveOptionsDropdown
+                visible: aiOverlayRoot.saveMenuVisible
+                width: 520; height: 480
+                anchors.top: headerBar.bottom; anchors.right: headerBar.right; anchors.rightMargin: 66
+                color: "white"; border.color: "black"; border.width: 3; radius: 8; z: 110
+
+                MouseArea {
+                    anchors.fill: parent
+                    onClicked: {}
+                }
+
+                ListView {
+                    anchors.fill: parent; anchors.margins: 8
+                    clip: true; spacing: 6
+                    model: aiOverlayRoot.utilityMenuItems.length
+                    delegate: Rectangle {
+                        property var itemData: aiOverlayRoot.utilityMenuItems[index]
+                        width: 500; height: 52; radius: 6
+                        color: itemData.rowType === "toggle" ? (itemData.isEnabled ? "#EFEFEF" : "white") : "black"
+                        border.color: "black"; border.width: itemData.rowType === "toggle" ? 2 : 1
+
+                        Text {
+                            anchors.left: parent.left; anchors.leftMargin: 14
+                            anchors.right: parent.right; anchors.rightMargin: 14
+                            anchors.verticalCenter: parent.verticalCenter
+                            font.family: aiOverlayRoot.vnFont; elide: Text.ElideRight
+                            text: itemData.label
+                            font.pixelSize: 18; font.bold: true
+                            color: itemData.rowType === "toggle" ? "black" : "white"
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                if (itemData.rowType === "builtin") {
+                                    aiOverlayRoot.saveMenuVisible = false;
+                                    if (itemData.actionId === "save_notebook") {
+                                        aiOverlayRoot.saveCurrentChatToQMLNotebook(false);
+                                    } else if (itemData.actionId === "copy_all") {
+                                        aiOverlayRoot.copyTextToClipboard(aiOverlayRoot.buildTranscriptMarkdown(), false);
+                                    }
+                                } else if (itemData.rowType === "toggle") {
+                                    aiOverlayRoot.toggleExtensionEnabled(itemData.extId);
+                                } else if (itemData.rowType === "action") {
+                                    aiOverlayRoot.saveMenuVisible = false;
+                                    aiOverlayRoot.triggerExtensionActionById(itemData.extId, itemData.actionId, null);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // THANH CẢNH BÁO
+            Column {
+                id: alertsColumn
+                anchors.top: headerBar.bottom
+                anchors.left: parent.left; anchors.right: parent.right
+                z: 25
+
+                Rectangle {
+                    visible: aiOverlayRoot.apiWarningBanner !== ""
+                    width: parent.width; height: 48; color: "black"
+                    Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: aiOverlayRoot.apiWarningBanner; font.pixelSize: 17; font.bold: true; color: "white" }
+                }
+
+                Rectangle {
+                    visible: aiOverlayRoot.tokenWarningBanner !== ""
+                    width: parent.width; height: 50; color: "#EFEFEF"; border.color: "black"; border.width: 2
+                    Text {
+                        anchors.left: parent.left; anchors.leftMargin: 16; anchors.verticalCenter: parent.verticalCenter
+                        font.family: aiOverlayRoot.vnFont
+                        text: aiOverlayRoot.tokenWarningBanner; font.pixelSize: 17; font.bold: true; color: "black"
+                    }
+                    Rectangle {
+                        width: 44; height: 36; anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter
+                        color: "white"; border.color: "black"; border.width: 2; radius: 4
+                        Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "×"; font.pixelSize: 22; font.bold: true }
+                        MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.tokenWarningBanner = "" }
+                    }
+                }
+
+                Rectangle {
+                    visible: aiOverlayRoot.saveStatusToast !== ""
+                    width: parent.width; height: 42; color: "#F5F5F5"; border.color: "black"; border.width: 1
+                    Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: aiOverlayRoot.saveStatusToast; font.pixelSize: 17; font.bold: true; color: "black" }
+                }
+            }
+
+            // MENU CHỌN MODEL TẠI CỬA SỔ CHAT TỔNG
+            Rectangle {
+                visible: aiOverlayRoot.modelMenuVisible
+                width: 520; height: 540
+                anchors.top: headerBar.bottom; anchors.left: headerBar.left; anchors.leftMargin: 14
+                color: "white"; border.color: "black"; border.width: 3; radius: 8; z: 110
+
+                ListView {
+                    anchors.fill: parent; anchors.margins: 8
+                    clip: true; spacing: 4
+                    model: aiOverlayRoot.availableModels.length
+                    delegate: Rectangle {
+                        width: 500; height: 52; radius: 6
+                        color: aiOverlayRoot.currentModelIndex === index ? "black" : "white"
+                        border.color: "black"; border.width: 1
+                        Text {
+                            anchors.left: parent.left; anchors.leftMargin: 12; anchors.right: parent.right; anchors.rightMargin: 12
+                            anchors.verticalCenter: parent.verticalCenter
+                            font.family: aiOverlayRoot.vnFont; elide: Text.ElideRight
+                            text: "[" + aiOverlayRoot.availableModels[index].provider.toUpperCase() + "] " + aiOverlayRoot.availableModels[index].label
+                            font.pixelSize: 18; font.bold: aiOverlayRoot.currentModelIndex === index
+                            color: aiOverlayRoot.currentModelIndex === index ? "white" : "black"
+                        }
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                aiOverlayRoot.currentModelIndex = index;
+                                aiOverlayRoot.modelMenuVisible = false;
+                                aiOverlayRoot.verifyActiveApiConnection();
+                            }
+                        }
+                    }
+                }
+            }
+
+            // =========================================================================
+            // TRANG SỔ TAY QML NỘI BỘ (ĐỌC LẠI LỊCH SỬ TRÒ CHUYỆN & GỌI EXTENSION XUẤT FILE)
+            // =========================================================================
+            Rectangle {
+                id: notebookPageContainer
+                visible: aiOverlayRoot.notebookPageVisible
+                anchors.top: alertsColumn.bottom
+                anchors.bottom: parent.bottom
+                anchors.left: parent.left; anchors.right: parent.right
+                anchors.margins: 16
+                color: "white"; z: 32
+
+                // Chế độ 1: Danh sách các ghi chú đã lưu trong Sổ tay
+                Column {
+                    visible: aiOverlayRoot.selectedNotebookIndex === -1
+                    anchors.fill: parent; anchors.margins: 10; spacing: 12
+
+                    Row {
+                        width: parent.width; spacing: 12
+                        Text {
+                            width: parent.width - 260; anchors.verticalCenter: parent.verticalCenter
+                            font.family: aiOverlayRoot.vnFont
+                            text: "📚 SỔ TAY LỊCH SỬ TRÒ CHUYỆN (" + savedNotebookModel.count + " bản ghi)"
+                            font.pixelSize: 22; font.bold: true; color: "black"
+                        }
+                        Rectangle {
+                            width: 240; height: 48; radius: 6; color: "black"
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "+ Lưu phiên hiện tại"; font.pixelSize: 17; font.bold: true; color: "white" }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.saveCurrentChatToQMLNotebook(false) }
+                        }
+                    }
+
+                    Rectangle { width: parent.width; height: 2; color: "black" }
+
+                    Text {
+                        visible: savedNotebookModel.count === 0
+                        font.family: aiOverlayRoot.vnFont
+                        text: "Chưa có ghi chú nào trong Sổ tay. Các cuộc trò chuyện sẽ tự động được lưu tại đây sau mỗi câu trả lời của AI."
+                        font.pixelSize: 19; color: "#555555"; wrapMode: Text.WordWrap; width: parent.width
+                    }
+
+                    ListView {
+                        id: notebookListView
+                        width: parent.width; height: parent.height - 90
+                        clip: true; spacing: 10
+                        model: savedNotebookModel
+
+                        delegate: Rectangle {
+                            width: notebookListView.width; height: 82; radius: 8
+                            color: "#F7F7F7"; border.color: "black"; border.width: 2
+
+                            Column {
+                                anchors.left: parent.left; anchors.leftMargin: 14
+                                anchors.right: noteActionRow.left; anchors.rightMargin: 12
+                                anchors.verticalCenter: parent.verticalCenter
+                                spacing: 4
+                                Text {
+                                    width: parent.width; elide: Text.ElideRight
+                                    font.family: aiOverlayRoot.vnFont; text: model.title
+                                    font.pixelSize: 19; font.bold: true; color: "black"
+                                }
+                                Text {
+                                    font.family: aiOverlayRoot.vnFont; text: "Thời gian lưu: " + model.createdAt
+                                    font.pixelSize: 16; color: "#444444"
+                                }
+                            }
+
+                            Row {
+                                id: noteActionRow
+                                anchors.right: parent.right; anchors.rightMargin: 12
+                                anchors.verticalCenter: parent.verticalCenter
+                                spacing: 8
+
+                                Rectangle {
+                                    width: 110; height: 48; radius: 6; color: "black"
+                                    Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Mở đọc"; font.pixelSize: 17; font.bold: true; color: "white" }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: {
+                                            aiOverlayRoot.viewingNoteTitle = model.title;
+                                            aiOverlayRoot.viewingNoteDate = model.createdAt;
+                                            aiOverlayRoot.viewingNoteContent = model.content;
+                                            aiOverlayRoot.selectedNotebookIndex = index;
+                                        }
+                                    }
+                                }
+                                Rectangle {
+                                    width: 125; height: 48; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                                    Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Xuất EPUB"; font.pixelSize: 17; font.bold: true; color: "black" }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: aiOverlayRoot.delegateExportToExtension(model.noteId, model.content, "export_epub")
+                                    }
+                                }
+                                Rectangle {
+                                    width: 80; height: 48; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                                    Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Xóa"; font.pixelSize: 17; font.bold: true; color: "black" }
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        onClicked: aiOverlayRoot.deleteNoteFromQMLNotebook(model.noteId)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Chế độ 2: Đọc chi tiết toàn màn hình một ghi chú trong Sổ tay
+                Column {
+                    visible: aiOverlayRoot.selectedNotebookIndex !== -1
+                    anchors.fill: parent; anchors.margins: 10; spacing: 10
+
+                    Row {
+                        width: parent.width; spacing: 10
+                        Rectangle {
+                            width: 170; height: 50; radius: 6; color: "black"
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "← Danh sách Sổ tay"; font.pixelSize: 17; font.bold: true; color: "white" }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.selectedNotebookIndex = -1 }
+                        }
+                        Rectangle {
+                            width: 180; height: 50; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Chép vào Clipboard"; font.pixelSize: 17; font.bold: true; color: "black" }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.copyTextToClipboard(aiOverlayRoot.viewingNoteContent, false) }
+                        }
+                        Rectangle {
+                            width: 210; height: 50; radius: 6; color: "black"
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Xuất thành sách EPUB"; font.pixelSize: 17; font.bold: true; color: "white" }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: aiOverlayRoot.delegateExportToExtension(aiOverlayRoot.viewingNoteTitle, aiOverlayRoot.viewingNoteContent, "export_epub")
+                            }
+                        }
+                    }
+
+                    Text {
+                        width: parent.width; elide: Text.ElideRight
+                        font.family: aiOverlayRoot.vnFont; text: aiOverlayRoot.viewingNoteTitle
+                        font.pixelSize: 20; font.bold: true; color: "black"
+                    }
+
+                    Rectangle {
+                        width: parent.width; height: parent.height - 115
+                        color: "#FAFAFA"; border.color: "black"; border.width: 2; radius: 8
+
+                        Flickable {
+                            anchors.fill: parent; anchors.margins: 16
+                            contentWidth: width; contentHeight: fullNoteReaderText.implicitHeight + 40
+                            clip: true
+
+                            Text {
+                                id: fullNoteReaderText
+                                width: parent.width
+                                font.family: aiOverlayRoot.vnFont
+                                text: aiOverlayRoot.viewingNoteContent
+                                font.pixelSize: 22; wrapMode: Text.WordWrap; color: "black"
+                            }
+                        }
+                    }
+                }
+            }
+
+            // =========================================================================
+            // TRANG CÀI ĐẶT: API KEY + MỨC ĐỘ TƯ DUY + TÌM KIẾM, LỌC & CHỌN MODELS
+            // =========================================================================
+            Rectangle {
+                id: settingsPageContainer
+                visible: aiOverlayRoot.settingsPageVisible && !aiOverlayRoot.notebookPageVisible
+                anchors.top: alertsColumn.bottom
+                anchors.bottom: virtualKeyboardPanel.visible ? virtualKeyboardPanel.top : parent.bottom
+                anchors.left: parent.left; anchors.right: parent.right
+                anchors.margins: 12
+                color: "white"; z: 30
+
+                Column {
+                    anchors.fill: parent; anchors.margins: 10; spacing: 8
+
+                    Text {
+                        font.family: aiOverlayRoot.vnFont
+                        text: "PHẦN 1: CÀI ĐẶT API KEY & MỨC ĐỘ TƯ DUY"
+                        font.pixelSize: 20; font.bold: true; color: "black"
+                    }
+
+                    Row {
+                        width: parent.width; spacing: 8
+                        Text { width: 150; height: 42; verticalAlignment: Text.AlignVCenter; font.family: aiOverlayRoot.vnFont; text: "1. Gemini Key:"; font.pixelSize: 17; font.bold: true; color: "black" }
+                        Rectangle {
+                            width: parent.width - 420; height: 42; radius: 6
+                            color: aiOverlayRoot.activeKeyField === 1 ? "#EFEFEF" : "white"
+                            border.color: "black"; border.width: aiOverlayRoot.activeKeyField === 1 ? 3 : 2
+                            Text {
+                                anchors.fill: parent; anchors.margins: 8; verticalAlignment: Text.AlignVCenter
+                                font.family: aiOverlayRoot.vnFont; font.pixelSize: 17; color: "black"; elide: Text.ElideMiddle
+                                text: aiOverlayRoot.geminiApiKey !== "" ? (aiOverlayRoot.geminiApiKey + (aiOverlayRoot.activeKeyField === 1 ? " ▏" : "")) : "(Trống - Chạm để nhập Gemini Key)"
+                            }
+                            MouseArea { anchors.fill: parent; onClicked: { aiOverlayRoot.activeKeyField = 1; aiOverlayRoot.showVirtualKeyboard = true; } }
+                        }
+                        Rectangle {
+                            width: 135; height: 42; radius: 6; color: "black"
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Dán Clipboard"; color: "white"; font.pixelSize: 16; font.bold: true }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.pasteFromClipboardToField(1) }
+                        }
+                        Rectangle {
+                            width: 95; height: 42; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Xóa ô"; color: "black"; font.pixelSize: 16; font.bold: true }
+                            MouseArea { anchors.fill: parent; onClicked: { aiOverlayRoot.geminiApiKey = ""; aiOverlayRoot.verifyActiveApiConnection(); } }
+                        }
+                    }
+
+                    Row {
+                        width: parent.width; spacing: 8
+                        Text { width: 150; height: 42; verticalAlignment: Text.AlignVCenter; font.family: aiOverlayRoot.vnFont; text: "2. Claude Key:"; font.pixelSize: 17; font.bold: true; color: "black" }
+                        Rectangle {
+                            width: parent.width - 420; height: 42; radius: 6
+                            color: aiOverlayRoot.activeKeyField === 2 ? "#EFEFEF" : "white"
+                            border.color: "black"; border.width: aiOverlayRoot.activeKeyField === 2 ? 3 : 2
+                            Text {
+                                anchors.fill: parent; anchors.margins: 8; verticalAlignment: Text.AlignVCenter
+                                font.family: aiOverlayRoot.vnFont; font.pixelSize: 17; color: "black"; elide: Text.ElideMiddle
+                                text: aiOverlayRoot.anthropicApiKey !== "" ? (aiOverlayRoot.anthropicApiKey + (aiOverlayRoot.activeKeyField === 2 ? " ▏" : "")) : "(Trống - Chạm để nhập Claude Key)"
+                            }
+                            MouseArea { anchors.fill: parent; onClicked: { aiOverlayRoot.activeKeyField = 2; aiOverlayRoot.showVirtualKeyboard = true; } }
+                        }
+                        Rectangle {
+                            width: 135; height: 42; radius: 6; color: "black"
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Dán Clipboard"; color: "white"; font.pixelSize: 16; font.bold: true }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.pasteFromClipboardToField(2) }
+                        }
+                        Rectangle {
+                            width: 95; height: 42; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Xóa ô"; color: "black"; font.pixelSize: 16; font.bold: true }
+                            MouseArea { anchors.fill: parent; onClicked: { aiOverlayRoot.anthropicApiKey = ""; aiOverlayRoot.verifyActiveApiConnection(); } }
+                        }
+                    }
+
+                    Row {
+                        width: parent.width; spacing: 8
+                        Text { width: 150; height: 42; verticalAlignment: Text.AlignVCenter; font.family: aiOverlayRoot.vnFont; text: "3. OpenAI Key:"; font.pixelSize: 17; font.bold: true; color: "black" }
+                        Rectangle {
+                            width: parent.width - 420; height: 42; radius: 6
+                            color: aiOverlayRoot.activeKeyField === 3 ? "#EFEFEF" : "white"
+                            border.color: "black"; border.width: aiOverlayRoot.activeKeyField === 3 ? 3 : 2
+                            Text {
+                                anchors.fill: parent; anchors.margins: 8; verticalAlignment: Text.AlignVCenter
+                                font.family: aiOverlayRoot.vnFont; font.pixelSize: 17; color: "black"; elide: Text.ElideMiddle
+                                text: aiOverlayRoot.openaiApiKey !== "" ? (aiOverlayRoot.openaiApiKey + (aiOverlayRoot.activeKeyField === 3 ? " ▏" : "")) : "(Trống - Chạm để nhập OpenAI Key)"
+                            }
+                            MouseArea { anchors.fill: parent; onClicked: { aiOverlayRoot.activeKeyField = 3; aiOverlayRoot.showVirtualKeyboard = true; } }
+                        }
+                        Rectangle {
+                            width: 135; height: 42; radius: 6; color: "black"
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Dán Clipboard"; color: "white"; font.pixelSize: 16; font.bold: true }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.pasteFromClipboardToField(3) }
+                        }
+                        Rectangle {
+                            width: 95; height: 42; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Xóa ô"; color: "black"; font.pixelSize: 16; font.bold: true }
+                            MouseArea { anchors.fill: parent; onClicked: { aiOverlayRoot.openaiApiKey = ""; aiOverlayRoot.verifyActiveApiConnection(); } }
+                        }
+                    }
+
+                    // Tùy chọn Mức độ tư duy (Thấp 1x / Trung bình 2x / Cao 4x)
+                    Row {
+                        width: parent.width; spacing: 8
+                        Text { width: 150; height: 42; verticalAlignment: Text.AlignVCenter; font.family: aiOverlayRoot.vnFont; text: "Mức độ tư duy:"; font.pixelSize: 17; font.bold: true; color: "black" }
+                        Repeater {
+                            model: [
+                                { "lvl": "low",    "title": "Thấp (1x Mặc định)" },
+                                { "lvl": "medium", "title": "Trung bình (2x Token)" },
+                                { "lvl": "high",   "title": "Cao (4x Tư duy sâu)" }
+                            ]
+                            Rectangle {
+                                width: 292; height: 42; radius: 6
+                                color: aiOverlayRoot.thinkingLevel === modelData.lvl ? "black" : "white"
+                                border.color: "black"; border.width: 2
+                                Text {
+                                    anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont
+                                    text: modelData.title
+                                    font.pixelSize: 16; font.bold: true
+                                    color: aiOverlayRoot.thinkingLevel === modelData.lvl ? "white" : "black"
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: {
+                                        aiOverlayRoot.thinkingLevel = modelData.lvl;
+                                        persistentSettings.thinkingLevel = modelData.lvl;
+                                        aiOverlayRoot.showToast("✓ Đã đặt Mức độ tư duy: " + modelData.title);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Row {
+                        width: parent.width; spacing: 10
+                        Rectangle {
+                            width: parent.width - 300; height: 46; radius: 6; color: "black"
+                            Text {
+                                anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont
+                                text: aiOverlayRoot.isFetchingModels ? "Đang gọi API lấy danh sách Models..." : "↻ Quét & Cập nhật Models từ API (Gemini / Claude / OpenAI)"
+                                font.pixelSize: 17; font.bold: true; color: "white"
+                            }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.fetchAllAvailableModels() }
+                        }
+                        Rectangle {
+                            width: 290; height: 46; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Đọc lại khóa từ api_keys.txt"; font.pixelSize: 17; font.bold: true; color: "black" }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    aiOverlayRoot.loadApiKeysDirectlyFromTxt(true);
+                                    aiOverlayRoot.showToast("✓ Đã nạp lại khóa từ api_keys.txt!");
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle { width: parent.width; height: 2; color: "black" }
+
+                    Row {
+                        width: parent.width; spacing: 12
+                        Text {
+                            font.family: aiOverlayRoot.vnFont
+                            text: "PHẦN 2: CHỌN MODEL HIỂN THỊ TẠI CỬA SỔ CHAT (Đang bật: " + aiOverlayRoot.availableModels.length + "/" + aiOverlayRoot.allModelsMaster.length + ")"
+                            font.pixelSize: 19; font.bold: true; color: "black"
+                        }
+                    }
+
+                    Row {
+                        width: parent.width; spacing: 8
+                        Rectangle {
+                            width: parent.width - 340; height: 44; radius: 6
+                            color: aiOverlayRoot.activeKeyField === 4 ? "#EFEFEF" : "white"
+                            border.color: "black"; border.width: aiOverlayRoot.activeKeyField === 4 ? 3 : 2
+                            Text {
+                                anchors.fill: parent; anchors.margins: 10; verticalAlignment: Text.AlignVCenter
+                                font.family: aiOverlayRoot.vnFont; font.pixelSize: 17
+                                color: aiOverlayRoot.modelSearchQuery === "" ? "#666666" : "black"
+                                text: aiOverlayRoot.modelSearchQuery === "" ? "🔍 Tìm kiếm tên hoặc ID model..." : ("🔍 " + aiOverlayRoot.modelSearchQuery + (aiOverlayRoot.activeKeyField === 4 ? " ▏" : ""))
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    aiOverlayRoot.activeKeyField = 4;
+                                    aiOverlayRoot.showVirtualKeyboard = true;
+                                }
+                            }
+                        }
+                        Rectangle {
+                            width: 96; height: 44; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Xóa tìm"; font.pixelSize: 16; font.bold: true; color: "black" }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    aiOverlayRoot.modelSearchQuery = "";
+                                    aiOverlayRoot.rebuildActiveAndFilteredModels();
+                                }
+                            }
+                        }
+                        Rectangle {
+                            width: 110; height: 44; radius: 6; color: "black"
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Chọn hết"; font.pixelSize: 16; font.bold: true; color: "white" }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.setBulkModelsEnabledForCurrentFilter(true) }
+                        }
+                        Rectangle {
+                            width: 110; height: 44; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Bỏ hết"; font.pixelSize: 16; font.bold: true; color: "black" }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.setBulkModelsEnabledForCurrentFilter(false) }
+                        }
+                    }
+
+                    Row {
+                        width: parent.width; spacing: 8
+                        Text { width: 145; height: 40; verticalAlignment: Text.AlignVCenter; font.family: aiOverlayRoot.vnFont; text: "Lọc dịch vụ AI:"; font.pixelSize: 17; font.bold: true; color: "black" }
+                        Repeater {
+                            model: [
+                                { "code": "all",    "title": "Tất cả" },
+                                { "code": "gemini", "title": "Google Gemini" },
+                                { "code": "claude", "title": "Anthropic Claude" },
+                                { "code": "openai", "title": "OpenAI" }
+                            ]
+                            Rectangle {
+                                width: 215; height: 40; radius: 6
+                                color: aiOverlayRoot.selectedProviderFilter === modelData.code ? "black" : "white"
+                                border.color: "black"; border.width: 2
+                                Text {
+                                    anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont
+                                    text: modelData.title
+                                    font.pixelSize: 17; font.bold: true
+                                    color: aiOverlayRoot.selectedProviderFilter === modelData.code ? "white" : "black"
+                                }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: {
+                                        aiOverlayRoot.selectedProviderFilter = modelData.code;
+                                        aiOverlayRoot.rebuildActiveAndFilteredModels();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        width: parent.width
+                        height: aiOverlayRoot.showVirtualKeyboard ? 340 : 710
+                        color: "white"; border.color: "black"; border.width: 2; radius: 6
+
+                        ListView {
+                            id: settingsModelsListView
+                            anchors.fill: parent; anchors.margins: 6
+                            clip: true; spacing: 6
+                            model: aiOverlayRoot.filteredSettingsModels.length
+
+                            delegate: Rectangle {
+                                width: settingsModelsListView.width; height: 50; radius: 6
+                                color: aiOverlayRoot.filteredSettingsModels[index].enabled ? "#F2F2F2" : "white"
+                                border.color: "black"; border.width: aiOverlayRoot.filteredSettingsModels[index].enabled ? 2 : 1
+
+                                Row {
+                                    anchors.fill: parent; anchors.leftMargin: 12; anchors.rightMargin: 12; spacing: 12
+
+                                    Rectangle {
+                                        width: 36; height: 36; radius: 4
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        color: aiOverlayRoot.filteredSettingsModels[index].enabled ? "black" : "white"
+                                        border.color: "black"; border.width: 2
+                                        Text {
+                                            anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont
+                                            text: aiOverlayRoot.filteredSettingsModels[index].enabled ? "✓" : ""
+                                            font.pixelSize: 22; font.bold: true; color: "white"
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        width: 96; height: 34; radius: 4
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        color: "white"; border.color: "black"; border.width: 1
+                                        Text {
+                                            anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont
+                                            text: aiOverlayRoot.filteredSettingsModels[index].provider.toUpperCase()
+                                            font.pixelSize: 15; font.bold: true; color: "black"
+                                        }
+                                    }
+
+                                    Text {
+                                        width: parent.width - 180; anchors.verticalCenter: parent.verticalCenter
+                                        font.family: aiOverlayRoot.vnFont; elide: Text.ElideRight
+                                        text: aiOverlayRoot.filteredSettingsModels[index].label + "  (" + aiOverlayRoot.filteredSettingsModels[index].id + ")"
+                                        font.pixelSize: 17; font.bold: aiOverlayRoot.filteredSettingsModels[index].enabled
+                                        color: "black"
+                                    }
+                                }
+
+                                MouseArea {
+                                    anchors.fill: parent
+                                    onClicked: {
+                                        aiOverlayRoot.toggleModelEnabledAtMaster(aiOverlayRoot.filteredSettingsModels[index].masterIndex);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Row {
+                        width: parent.width; spacing: 10
+                        Rectangle {
+                            width: parent.width - 310; height: 48; radius: 6; color: "#F2F2F2"; border.color: "black"; border.width: 1
+                            Text {
+                                anchors.fill: parent; anchors.margins: 8; verticalAlignment: Text.AlignVCenter
+                                font.family: aiOverlayRoot.vnFont; font.pixelSize: 16; color: "black"; elide: Text.ElideRight
+                                text: aiOverlayRoot.modelSyncStatus
+                            }
+                        }
+                        Rectangle {
+                            width: 300; height: 48; radius: 6; color: "black"
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "✓ Hoàn tất & Mở màn hình Chat"; font.pixelSize: 17; font.bold: true; color: "white" }
+                            MouseArea {
+                                anchors.fill: parent
+                                onClicked: {
+                                    aiOverlayRoot.activeKeyField = 0;
+                                    aiOverlayRoot.settingsPageVisible = false;
+                                    aiOverlayRoot.verifyActiveApiConnection();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // DANH SÁCH TIN NHẮN HỘI THOẠI (Chống tràn bộ nhớ đệm hiển thị với PlainText & implicitHeight)
+            ListView {
+                id: chatListView
+                visible: !aiOverlayRoot.settingsPageVisible && !aiOverlayRoot.notebookPageVisible
+                anchors.top: alertsColumn.bottom
+                anchors.bottom: selectionBanner.visible ? selectionBanner.top : inputContainer.top
+                anchors.left: parent.left; anchors.right: parent.right; anchors.margins: 20
+                clip: true; spacing: 18; model: chatLogModel
+                cacheBuffer: 4000
+
+                delegate: Column {
+                    width: chatListView.width; spacing: 6
+                    Item {
+                        width: parent.width; height: 42
+                        Text { anchors.left: parent.left; anchors.verticalCenter: parent.verticalCenter; font.family: aiOverlayRoot.vnFont; text: model.sender + ":"; font.pixelSize: 21; font.bold: true; color: "black" }
+                        Row {
+                            anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter; spacing: 10; visible: model.sender !== "Bạn"
+                            Rectangle {
+                                width: 125; height: 38; radius: 6; color: model.copied ? "black" : "white"; border.color: "black"; border.width: 2
+                                Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: model.copied ? "✓ Đã chép" : "Chép"; font.pixelSize: 17; font.bold: true; color: model.copied ? "white" : "black" }
+                                MouseArea { anchors.fill: parent; onClicked: { aiOverlayRoot.copyTextToClipboard(model.msgText, false); chatLogModel.setProperty(index, "copied", true); } }
+                            }
+                            Rectangle {
+                                width: 150; height: 38; radius: 6; color: "black"
+                                Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Chép & Đóng"; font.pixelSize: 17; font.bold: true; color: "white" }
+                                MouseArea { anchors.fill: parent; onClicked: { chatLogModel.setProperty(index, "copied", true); aiOverlayRoot.copyTextToClipboard(model.msgText, true); } }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        width: parent.width; implicitHeight: msgBody.implicitHeight + 24; height: implicitHeight
+                        color: model.sender === "Bạn" ? "#EFEFEF" : "white"; border.color: "black"; border.width: model.sender === "Bạn" ? 1 : 2; radius: 8
+                        Text {
+                            id: msgBody
+                            width: parent.width - 24
+                            x: 12; y: 12
+                            font.family: aiOverlayRoot.vnFont
+                            text: model.msgText
+                            textFormat: Text.PlainText
+                            font.pixelSize: 23
+                            wrapMode: Text.WordWrap
+                            color: "black"
+                        }
+                    }
+                }
+            }
+
+            // KHUNG TRÍCH DẪN VĂN BẢN ĐANG CHỌN
+            Rectangle {
+                id: selectionBanner
+                visible: !aiOverlayRoot.settingsPageVisible && !aiOverlayRoot.notebookPageVisible && aiOverlayRoot.quotedSelection !== ""
+                width: parent.width; height: 132; anchors.bottom: inputContainer.top
+                color: "#F2F2F2"; border.color: "black"; border.width: 2; z: 20
+                Text {
+                    anchors.top: parent.top; anchors.left: parent.left; anchors.right: clearQuoteBtn.left; anchors.margins: 12
+                    font.family: aiOverlayRoot.vnFont
+                    text: "Đoạn đang chọn: \"" + aiOverlayRoot.quotedSelection + "\""; font.pixelSize: 19; font.italic: true
+                    elide: Text.ElideRight; maximumLineCount: 2; wrapMode: Text.WordWrap; color: "black"
+                }
+                Rectangle {
+                    id: clearQuoteBtn; width: 42; height: 42; anchors.top: parent.top; anchors.right: parent.right; anchors.margins: 10
+                    color: "white"; border.color: "black"; border.width: 2; radius: 6
+                    Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "×"; font.pixelSize: 24; font.bold: true }
+                    MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.quotedSelection = ""; }
+                }
+                Row {
+                    anchors.bottom: parent.bottom; anchors.left: parent.left; anchors.margins: 12; spacing: 12
+                    Repeater {
+                        model: [
+                            { "title": "Giải thích chi tiết", "prompt": "Hãy giải thích chi tiết và dễ hiểu ý nghĩa của đoạn văn bản này." },
+                            { "title": "Tóm tắt ý chính", "prompt": "Tóm tắt ngắn gọn các luận điểm chính của đoạn văn bản này." },
+                            { "title": "Dịch sang Tiếng Việt", "prompt": "Dịch đoạn văn bản này sang tiếng Việt tự nhiên, chuẩn thuật ngữ chuyên ngành." }
+                        ]
+                        Rectangle {
+                            width: 240; height: 46; radius: 8; color: "black"
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: modelData.title; color: "white"; font.pixelSize: 19; font.bold: true }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.sendPrompt(modelData.prompt, false) }
+                        }
+                    }
+                }
+            }
+
+            // Ô NHẬP CÂU HỎI TỰ VẼ ("Gõ câu hỏi ...")
+            Rectangle {
+                id: inputContainer
+                visible: !aiOverlayRoot.settingsPageVisible && !aiOverlayRoot.notebookPageVisible
+                width: parent.width; height: 92
+                anchors.bottom: virtualKeyboardPanel.visible ? virtualKeyboardPanel.top : parent.bottom
+                color: "white"; border.color: "black"; border.width: 2; z: 20
+
+                Rectangle {
+                    anchors.left: parent.left; anchors.right: sendBtn.left; anchors.top: parent.top; anchors.bottom: parent.bottom; anchors.margins: 12
+                    border.color: "black"; border.width: aiOverlayRoot.activeKeyField === 0 ? 3 : 2; radius: 6
+                    color: "white"; clip: true
+
+                    Text {
+                        anchors.fill: parent; anchors.margins: 12
+                        verticalAlignment: Text.AlignVCenter
+                        font.family: aiOverlayRoot.vnFont; font.pixelSize: 23
+                        color: aiOverlayRoot.currentDraftText === "" ? "#777777" : "black"
+                        text: aiOverlayRoot.currentDraftText === "" ? "Gõ câu hỏi ..." : (aiOverlayRoot.currentDraftText + " ▏")
+                        wrapMode: Text.WrapAnywhere; maximumLineCount: 2
+                    }
+
+                    MouseArea {
+                        anchors.fill: parent
+                        onClicked: {
+                            aiOverlayRoot.suppressSystemKeyboard();
+                            aiOverlayRoot.activeKeyField = 0;
+                            aiOverlayRoot.showVirtualKeyboard = true;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    id: sendBtn
+                    width: 140; anchors.right: parent.right; anchors.top: parent.top; anchors.bottom: parent.bottom; anchors.margins: 12
+                    color: "black"; radius: 6
+                    Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: aiOverlayRoot.isSending ? "..." : "Gửi"; color: "white"; font.pixelSize: 23; font.bold: true }
+                    MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.sendPrompt(aiOverlayRoot.currentDraftText, false) }
+                }
+            }
+
+            // BÀN PHÍM NỔI QWERTY UNIKEY TELEX
+            Rectangle {
+                id: virtualKeyboardPanel
+                visible: aiOverlayRoot.showVirtualKeyboard && !aiOverlayRoot.notebookPageVisible
+                width: parent.width; height: 396
+                anchors.bottom: parent.bottom
+                color: "#EEEEEE"; border.color: "black"; border.width: 3; z: 35
+
+                Column {
+                    anchors.fill: parent; anchors.margins: 8; spacing: 7
+
+                    Row {
+                        anchors.horizontalCenter: parent.horizontalCenter; spacing: 8
+                        Repeater {
+                            model: aiOverlayRoot.symbolPageActive ? ["!","@","#","$","%","^","&","+","(",")"] : ["1","2","3","4","5","6","7","8","9","0"]
+                            Rectangle {
+                                width: 98; height: 50; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                                Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: modelData; font.pixelSize: 22; font.bold: true; color: "black" }
+                                MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.handleVirtualKeyPress(modelData) }
+                            }
+                        }
+                    }
+
+                    Row {
+                        anchors.horizontalCenter: parent.horizontalCenter; spacing: 8
+                        Repeater {
+                            model: aiOverlayRoot.symbolPageActive ? ["-","_","=","+","[","]","{","}","\\","|"] : ["q","w","e","r","t","y","u","i","o","p"]
+                            Rectangle {
+                                width: 98; height: 54; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                                Text {
+                                    anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont
+                                    text: (!aiOverlayRoot.symbolPageActive && aiOverlayRoot.shiftActive) ? modelData.toUpperCase() : modelData
+                                    font.pixelSize: 24; font.bold: true; color: "black"
+                                }
+                                MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.handleVirtualKeyPress(modelData) }
+                            }
+                        }
+                    }
+
+                    Row {
+                        anchors.horizontalCenter: parent.horizontalCenter; spacing: 8
+                        Repeater {
+                            model: aiOverlayRoot.symbolPageActive ? [";",":","'","\"","<",">","/","?","~","`"] : ["a","s","d","f","g","h","j","k","l","?"]
+                            Rectangle {
+                                width: 98; height: 54; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                                Text {
+                                    anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont
+                                    text: (!aiOverlayRoot.symbolPageActive && aiOverlayRoot.shiftActive) ? modelData.toUpperCase() : modelData
+                                    font.pixelSize: 24; font.bold: true; color: "black"
+                                }
+                                MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.handleVirtualKeyPress(modelData) }
+                            }
+                        }
+                    }
+
+                    Row {
+                        anchors.horizontalCenter: parent.horizontalCenter; spacing: 8
+                        Rectangle {
+                            width: 114; height: 54; radius: 6
+                            color: aiOverlayRoot.shiftActive ? "black" : "white"; border.color: "black"; border.width: 2
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Shift"; font.pixelSize: 20; font.bold: true; color: aiOverlayRoot.shiftActive ? "white" : "black" }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.handleVirtualKeyPress("SHIFT") }
+                        }
+                        Repeater {
+                            model: aiOverlayRoot.symbolPageActive ? ["•","€","£","¥","©","®","±","×","÷"] : ["z","x","c","v","b","n","m",",","."]
+                            Rectangle {
+                                width: 86; height: 54; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                                Text {
+                                    anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont
+                                    text: (!aiOverlayRoot.symbolPageActive && aiOverlayRoot.shiftActive) ? modelData.toUpperCase() : modelData
+                                    font.pixelSize: 24; font.bold: true; color: "black"
+                                }
+                                MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.handleVirtualKeyPress(modelData) }
+                            }
+                        }
+                        Rectangle {
+                            width: 114; height: 54; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Xóa lùi"; font.pixelSize: 20; font.bold: true; color: "black" }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.handleVirtualKeyPress("BACKSPACE") }
+                        }
+                    }
+
+                    Row {
+                        anchors.horizontalCenter: parent.horizontalCenter; spacing: 8
+                        Rectangle {
+                            width: 130; height: 54; radius: 6
+                            color: aiOverlayRoot.symbolPageActive ? "black" : "white"; border.color: "black"; border.width: 2
+                            Text {
+                                anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont
+                                text: aiOverlayRoot.symbolPageActive ? "ABC" : "#+="
+                                font.pixelSize: 20; font.bold: true; color: aiOverlayRoot.symbolPageActive ? "white" : "black"
+                            }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.handleVirtualKeyPress("SYM_TOGGLE") }
+                        }
+                        Rectangle {
+                            width: 175; height: 54; radius: 6
+                            color: aiOverlayRoot.telexEnabled ? "black" : "white"; border.color: "black"; border.width: 2
+                            Text {
+                                anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont
+                                text: aiOverlayRoot.telexEnabled ? "Gõ: VI Telex" : "Gõ: Tiếng Anh"
+                                font.pixelSize: 19; font.bold: true; color: aiOverlayRoot.telexEnabled ? "white" : "black"
+                            }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.handleVirtualKeyPress("TELEX") }
+                        }
+                        Rectangle {
+                            width: 115; height: 54; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Xóa hết"; font.pixelSize: 18; font.bold: true; color: "black" }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.handleVirtualKeyPress("CLEAR") }
+                        }
+                        Rectangle {
+                            width: 440; height: 54; radius: 6; color: "white"; border.color: "black"; border.width: 2
+                            Text {
+                                anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont
+                                text: aiOverlayRoot.telexEnabled ? "Dấu cách" : "Space (English)"
+                                font.pixelSize: 19; font.bold: true; color: "black"
+                            }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.handleVirtualKeyPress("SPACE") }
+                        }
+                        Rectangle {
+                            width: 180; height: 54; radius: 6; color: "black"
+                            Text { anchors.centerIn: parent; font.family: aiOverlayRoot.vnFont; text: "Gửi câu hỏi"; font.pixelSize: 19; font.bold: true; color: "white" }
+                            MouseArea { anchors.fill: parent; onClicked: aiOverlayRoot.sendPrompt(aiOverlayRoot.currentDraftText, false) }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+END TRAVERSE
+END AFFECT
+

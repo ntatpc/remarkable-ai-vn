@@ -1,0 +1,6 @@
+[Unit]
+Description=reMarkable AI Assistant EPUB/PDF Exporter Worker
+
+[Service]
+Type=oneshot
+ExecStart=/home/root/AI_Notes/run_export.sh
