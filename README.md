@@ -106,4 +106,4 @@ curl -fsSL https://raw.githubusercontent.com/ntatpc/remarkable-ai-vn/main/instal
 
 ## 📄 Giấy phép (License)
 
-Dự án được phát hành mã nguồn mở theo các điều khoản của giấy phép [MIT License](LICENSE).
+Dự án được phát hành mã nguồn mở theo các điều khoản của giấy phép [GPL-3.0 license](LICENSE).
